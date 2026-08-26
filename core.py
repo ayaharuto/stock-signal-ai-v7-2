@@ -78,7 +78,7 @@ def add_price_features(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy().sort_index()
     close = x["Close"].astype(float)
     volume = x["Volume"].astype(float)
-    for n in [5, 10, 20, 50, 100, 200]:
+    for n in [5, 10, 20, 50, 60, 100, 200]:
         x[f"ret_{n}"] = close.pct_change(n)
     for n in [20, 50, 100, 200]:
         x[f"sma_{n}"] = close.rolling(n).mean()
