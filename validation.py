@@ -218,3 +218,178 @@ def validation_grade(metrics: pd.DataFrame) -> Dict[str, object]:
     else:
         grade = "D 根拠不足"
     return {"grade": grade, "score": round(float(score), 1), "reason": f"20日基準: n={n}, 勝率={win:.1%}, 平均={avg:.1%}, 超過={excess:.1%}"}
+
+
+def execution_trade_backtest(
+    signals: pd.DataFrame,
+    px: pd.DataFrame,
+    horizon: int = 20,
+    transaction_cost_bps: float = 12.0,
+    slippage_bps: float = 8.0,
+    stop_atr_mult: float = 1.5,
+    target_r: float = 2.2,
+    max_gap_pct: float = 0.035,
+    cooldown: int = 5,
+) -> pd.DataFrame:
+    """Conservative next-session execution test for historical signals.
+
+    Signal formation uses the signal-date close and ATR known at that time. Entry is
+    the next trading day's open, not the signal close. Gap-ups beyond max_gap_pct are
+    skipped. If stop and target are both touched in the same bar, stop is assumed to
+    occur first. Costs include round-trip transaction costs plus slippage.
+    """
+    if signals is None or signals.empty or px is None or px.empty:
+        return pd.DataFrame()
+    d = px.copy().sort_index()
+    d.index = pd.to_datetime(d.index)
+    for c in ["Open", "High", "Low", "Close"]:
+        if c not in d.columns:
+            return pd.DataFrame()
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    prev = d["Close"].shift(1)
+    tr = pd.concat([
+        d["High"] - d["Low"],
+        (d["High"] - prev).abs(),
+        (d["Low"] - prev).abs(),
+    ], axis=1).max(axis=1)
+    # EWM ATR at each date only uses present/past observations.
+    atr14 = tr.ewm(alpha=1 / 14, adjust=False).mean()
+
+    s = signals.copy().sort_index()
+    s.index = pd.to_datetime(s.index)
+    sig_dates = [dt for dt in s.index[s.get("signal", False).fillna(False)] if dt in d.index]
+    positions = {dt: i for i, dt in enumerate(d.index)}
+    rows = []
+    last_signal_i = -10**9
+    round_trip_cost = 2.0 * (float(transaction_cost_bps) + float(slippage_bps)) / 10000.0
+
+    for dt in sig_dates:
+        i = positions.get(dt)
+        if i is None or i + 1 >= len(d) or i - last_signal_i < int(cooldown):
+            continue
+        last_signal_i = i
+        signal_close = float(d["Close"].iloc[i])
+        atr_v = float(atr14.iloc[i]) if pd.notna(atr14.iloc[i]) else signal_close * 0.03
+        entry_i = i + 1
+        entry = float(d["Open"].iloc[entry_i])
+        if not np.isfinite(entry) or entry <= 0:
+            continue
+        gap = entry / signal_close - 1.0
+        if gap > float(max_gap_pct):
+            rows.append({
+                "SignalDate": dt, "EntryDate": d.index[entry_i], "Status": "gap_skip",
+                "Entry": entry, "Gap": gap, "NetReturn": np.nan, "Bars": 0,
+            })
+            continue
+
+        risk_per_share = max(float(stop_atr_mult) * atr_v, entry * 0.015)
+        stop = max(0.01, entry - risk_per_share)
+        target = entry + float(target_r) * (entry - stop)
+        exit_price = None
+        exit_reason = None
+        exit_date = None
+        mfe = -np.inf
+        mae = np.inf
+        max_j = min(entry_i + int(horizon), len(d) - 1)
+        for j in range(entry_i, max_j + 1):
+            lo = float(d["Low"].iloc[j]); hi = float(d["High"].iloc[j]); cl = float(d["Close"].iloc[j])
+            mae = min(mae, lo / entry - 1.0)
+            mfe = max(mfe, hi / entry - 1.0)
+            hit_stop = lo <= stop
+            hit_target = hi >= target
+            if hit_stop and hit_target:
+                exit_price, exit_reason, exit_date = stop, "stop_same_bar_conservative", d.index[j]
+                break
+            if hit_stop:
+                exit_price, exit_reason, exit_date = stop, "stop", d.index[j]
+                break
+            if hit_target:
+                exit_price, exit_reason, exit_date = target, "target", d.index[j]
+                break
+            if j == max_j:
+                exit_price, exit_reason, exit_date = cl, "time", d.index[j]
+
+        if exit_price is None:
+            continue
+        gross = float(exit_price / entry - 1.0)
+        net = gross - round_trip_cost
+        rows.append({
+            "SignalDate": dt,
+            "EntryDate": d.index[entry_i],
+            "ExitDate": exit_date,
+            "Status": "traded",
+            "Entry": entry,
+            "Stop": stop,
+            "Target": target,
+            "Exit": exit_price,
+            "ExitReason": exit_reason,
+            "Gap": gap,
+            "GrossReturn": gross,
+            "NetReturn": net,
+            "MAE": mae if np.isfinite(mae) else np.nan,
+            "MFE": mfe if np.isfinite(mfe) else np.nan,
+            "Bars": int(positions.get(exit_date, entry_i) - entry_i + 1) if exit_date in positions else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
+def execution_metrics(trades: pd.DataFrame, bootstrap_samples: int = 1200) -> Dict[str, object]:
+    """Summarize execution-realistic trades and bootstrap mean-return uncertainty."""
+    if trades is None or trades.empty:
+        return {"trades": 0, "status": "insufficient"}
+    t = trades[trades.get("Status", "") == "traded"].copy() if "Status" in trades else trades.copy()
+    r = pd.to_numeric(t.get("NetReturn", pd.Series(dtype=float)), errors="coerce").dropna()
+    if r.empty:
+        return {"trades": 0, "status": "insufficient"}
+    wins = r[r > 0]; losses = r[r <= 0]
+    gross_profit = float(wins.sum()) if len(wins) else 0.0
+    gross_loss = abs(float(losses.sum())) if len(losses) else 0.0
+    profit_factor = gross_profit / gross_loss if gross_loss > 1e-12 else (float("inf") if gross_profit > 0 else np.nan)
+    rng = np.random.default_rng(42)
+    if len(r) >= 5:
+        boot = rng.choice(r.to_numpy(), size=(int(bootstrap_samples), len(r)), replace=True).mean(axis=1)
+        ci_low, ci_high = np.quantile(boot, [0.10, 0.90])
+    else:
+        ci_low = ci_high = np.nan
+    skipped = int((trades.get("Status", pd.Series(dtype=str)) == "gap_skip").sum()) if "Status" in trades else 0
+    return {
+        "trades": int(len(r)),
+        "skipped_gap": skipped,
+        "win_rate": float((r > 0).mean()),
+        "avg_return": float(r.mean()),
+        "median_return": float(r.median()),
+        "expectancy": float(r.mean()),
+        "profit_factor": float(profit_factor),
+        "avg_mae": float(pd.to_numeric(t.get("MAE", np.nan), errors="coerce").mean()),
+        "avg_mfe": float(pd.to_numeric(t.get("MFE", np.nan), errors="coerce").mean()),
+        "avg_bars": float(pd.to_numeric(t.get("Bars", np.nan), errors="coerce").mean()),
+        "mean_ci10": float(ci_low) if np.isfinite(ci_low) else np.nan,
+        "mean_ci90": float(ci_high) if np.isfinite(ci_high) else np.nan,
+        "status": "ok" if len(r) >= 12 else "small_sample",
+    }
+
+
+def execution_grade(metrics: Dict[str, object]) -> Dict[str, object]:
+    """Conservative go/no-go grade. Positive average alone is not enough."""
+    n = int(metrics.get("trades", 0) or 0)
+    wr = float(metrics.get("win_rate", 0) or 0)
+    exp = float(metrics.get("expectancy", 0) or 0)
+    pf = float(metrics.get("profit_factor", 0) or 0) if np.isfinite(metrics.get("profit_factor", np.nan)) else 0.0
+    ci_low = float(metrics.get("mean_ci10", np.nan))
+    sample = min(1.0, n / 30.0)
+    score = 100.0 * (
+        0.25 * sample
+        + 0.20 * np.clip((wr - 0.42) / 0.22, 0, 1)
+        + 0.25 * np.clip((exp + 0.005) / 0.06, 0, 1)
+        + 0.20 * np.clip((pf - 0.8) / 1.4, 0, 1)
+        + 0.10 * (1.0 if np.isfinite(ci_low) and ci_low > 0 else 0.0)
+    )
+    if n >= 25 and exp > 0 and pf >= 1.25 and np.isfinite(ci_low) and ci_low > -0.003:
+        grade = "A｜実戦検証良好"
+    elif n >= 15 and exp > 0 and pf >= 1.05:
+        grade = "B｜小さく試す候補"
+    elif n >= 8:
+        grade = "C｜根拠不足・監視"
+    else:
+        grade = "D｜サンプル不足"
+    return {"grade": grade, "score": round(float(score), 1)}

@@ -32,7 +32,7 @@ from market_scanner import (
     enrich_with_listed, collect_recent_supply_market,
 )
 from supply_demand import summarize_supply_demand, build_market_supply_snapshot, merge_supply_snapshot
-from validation import make_signal_history, event_study, validation_grade
+from validation import make_signal_history, event_study, validation_grade, execution_trade_backtest, execution_metrics, execution_grade
 from optimizer import optimize_adaptive_weights, BASELINE_WEIGHTS
 from sources import (
     JQuantsAPIClient,
@@ -43,7 +43,7 @@ from sources import (
     source_confidence,
 )
 
-st.set_page_config(page_title="Stock Signal AI v7.3", page_icon="📈", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Stock Signal AI v8.0", page_icon="📈", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown(
     """
@@ -69,8 +69,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("Stock Signal AI v7.3")
-st.caption("個人向けJ-Quants API V2対応。分析機能は維持したまま、公式・一次情報を優先し、日本株全体スキャン、100点評価、需給先回り、過去検証、適応配点を1つのURLで使えます。取得できないデータを推測で埋めず、鮮度と情報充足度を明示します。")
+st.title("Stock Signal AI v8.0")
+st.caption("個人向けJ-Quants API V2対応。V8は『当てる』だけでなく、**市場環境・アウトオブサンプル優位性・資金管理・現実的な約定検証**を通過した銘柄だけを実戦候補にします。取得できないデータは推測で埋めません。")
 
 def _safe_secret(name: str, default: str = "") -> str:
     """Read hosting secret first, then environment variable. Never expose secrets in UI."""
@@ -148,8 +148,8 @@ with st.expander("👋 使い方（30秒）", expanded=False):
 **普段はこの3操作だけです。**
 
 1. **🌐 今日**を開く
-2. **今日の買い候補を更新**を押す
-3. 上位候補を見て、気になる銘柄は **🔎 個別** で100点評価・需給・過去検証を確認
+2. **今日の結論を更新**を押す（全市場→100点→売買プランまで自動）
+3. 「今日の結論」で **買い候補・買い目安・損切り・利確** を確認し、気になる銘柄だけ **🔎 個別** で詳細確認
 
 公式・一次情報を優先します。SNS・匿名掲示板・まとめサイトは標準スコアには使いません。  
 契約プランで取得できない公式データは**推測で補完せず「未取得」扱い**にし、情報充足度・信頼度を下げます。
@@ -161,6 +161,13 @@ with st.sidebar:
     horizon = st.selectbox("AI予測期間", [5, 10, 20, 60], index=2, format_func=lambda x: f"{x}営業日")
     tx_cost = st.slider("片道売買コスト", 0, 50, 12, format="%d bps")
     benchmark_code = st.text_input("市場ベンチマーク", "1306")
+    st.divider()
+    st.subheader("資金管理")
+    account_capital = st.number_input("運用資金（円）", min_value=100_000, max_value=500_000_000, value=1_000_000, step=100_000, help="推奨株数の計算にだけ使います。証券口座とは接続しません。")
+    risk_per_trade_pct = st.slider("1回の最大許容損失", 0.2, 2.0, 0.6, 0.1, format="%.1f%%")
+    max_position_pct = st.slider("1銘柄の最大投資比率", 5, 40, 20, 1, format="%d%%")
+    max_positions = st.slider("同時保有上限", 1, 10, 5)
+    slippage_bps = st.slider("想定スリッページ（片道）", 0, 40, 8, 1, format="%d bps")
     st.divider()
     st.caption("EDINET/FREDは公開側Secretsに設定可能。未設定でも主要機能は動きますが、情報信頼度・マクロ分析の一部が減ります。")
 
@@ -305,7 +312,7 @@ def analyze_one(
     supply_summary: dict | None = None,
 ) -> Dict:
     features = prepare_features(px, bm, fundamentals, macro)
-    X_train, y, _ = make_supervised(features, cfg.horizon_days)
+    X_train, y, future_return = make_supervised(features, cfg.horizon_days)
     coverage_by_col = X_train.notna().mean()
     usable_cols = coverage_by_col[coverage_by_col >= 0.60].index.tolist()
     if len(usable_cols) < 5:
@@ -385,6 +392,9 @@ def analyze_one(
         "deterministic": ds,
         "backtest": bt,
         "performance": pm,
+        "future_return": future_return,
+        "px": px,
+        "bm": bm,
     }
 
 
@@ -410,6 +420,271 @@ def score_gauge(score: float):
     ))
     fig.update_layout(height=280, margin=dict(l=20, r=20, t=60, b=10))
     return fig
+
+
+
+def _finite_float(value, fallback=np.nan) -> float:
+    try:
+        v = float(value)
+        return v if np.isfinite(v) else float(fallback)
+    except Exception:
+        return float(fallback)
+
+
+def market_regime_from_benchmark(bm: pd.DataFrame) -> Dict[str, object]:
+    """Simple transparent market gate using only confirmed benchmark daily bars."""
+    if bm is None or bm.empty or len(bm) < 210:
+        return {"state": "不明", "score": 50.0, "reason": "ベンチマーク履歴不足"}
+    f = add_price_features(bm).dropna(subset=["Close"])
+    if f.empty:
+        return {"state": "不明", "score": 50.0, "reason": "ベンチマーク計算不可"}
+    r = f.iloc[-1]
+    close = _finite_float(r.get("Close"), 0)
+    sma20 = _finite_float(r.get("sma_20"), close)
+    sma50 = _finite_float(r.get("sma_50"), close)
+    sma200 = _finite_float(r.get("sma_200"), close)
+    ret20 = _finite_float(r.get("ret_20"), 0)
+    ret60 = _finite_float(r.get("ret_60"), 0)
+    vol20 = _finite_float(r.get("vol_20"), 0.25)
+    score = 0.0
+    score += 24 if close > sma200 else 4
+    score += 18 if sma50 > sma200 else 5
+    score += 16 if sma20 > sma50 else 5
+    score += float(np.clip((ret20 + 0.08) / 0.16, 0, 1)) * 18
+    score += float(np.clip((ret60 + 0.12) / 0.24, 0, 1)) * 16
+    score += float(np.clip((0.38 - vol20) / 0.28, 0, 1)) * 8
+    score = float(np.clip(score, 0, 100))
+    if score >= 68:
+        state = "強気"
+    elif score >= 48:
+        state = "中立"
+    else:
+        state = "弱気"
+    reason = f"20日 {ret20:+.1%} / 60日 {ret60:+.1%} / 年率ボラ {vol20:.1%}"
+    return {"state": state, "score": round(score, 1), "reason": reason}
+
+
+def oos_edge_profile(result: Dict) -> Dict[str, object]:
+    """Choose a probability threshold on earlier OOS rows, evaluate it on later OOS rows."""
+    wf = result.get("wf")
+    future_return = result.get("future_return", pd.Series(dtype=float))
+    if wf is None or future_return is None or len(future_return) == 0:
+        return {"threshold": 0.60, "n": 0, "win_rate": np.nan, "avg_return": np.nan, "status": "insufficient"}
+    p = pd.to_numeric(wf.probabilities, errors="coerce").dropna()
+    r = pd.to_numeric(future_return.reindex(p.index), errors="coerce")
+    d = pd.DataFrame({"p": p, "r": r}).dropna().sort_index()
+    if len(d) < 80:
+        return {"threshold": 0.60, "n": 0, "win_rate": np.nan, "avg_return": np.nan, "status": "insufficient"}
+    split = max(int(len(d) * 0.60), 40)
+    cal, ev = d.iloc[:split], d.iloc[split:]
+    cost = 2.0 * (float(cfg.transaction_cost_bps) + float(slippage_bps)) / 10000.0
+    best_t, best_u = 0.60, -1e9
+    for t in np.arange(0.52, 0.73, 0.02):
+        rr = cal.loc[cal["p"] >= t, "r"] - cost
+        if len(rr) < 10:
+            continue
+        utility = float(rr.mean()) * np.sqrt(len(rr)) + 0.015 * float((rr > 0).mean() - 0.5)
+        if utility > best_u:
+            best_t, best_u = float(t), utility
+    rr = ev.loc[ev["p"] >= best_t, "r"] - cost
+    if len(rr) < 6:
+        return {"threshold": round(best_t, 2), "n": int(len(rr)), "win_rate": np.nan, "avg_return": np.nan, "status": "small_sample"}
+    return {
+        "threshold": round(best_t, 2),
+        "n": int(len(rr)),
+        "win_rate": float((rr > 0).mean()),
+        "avg_return": float(rr.mean()),
+        "median_return": float(rr.median()),
+        "status": "ok" if len(rr) >= 12 else "small_sample",
+    }
+
+
+def practical_readiness(result: Dict) -> Dict[str, object]:
+    m = result.get("wf").metrics if result.get("wf") is not None else {}
+    pm = result.get("performance", {})
+    edge = oos_edge_profile(result)
+    regime = market_regime_from_benchmark(result.get("bm", pd.DataFrame()))
+    auc = _finite_float(m.get("auc"), np.nan)
+    bal = _finite_float(m.get("balanced_accuracy"), 0.5)
+    brier = _finite_float(m.get("brier"), 0.25)
+    checks = {
+        "OOS標本": int(m.get("oos_rows", 0) or 0) >= 252,
+        "モデル": ((np.isfinite(auc) and auc >= 0.52) or bal >= 0.52) and brier <= 0.255,
+        "確率別優位性": int(edge.get("n", 0) or 0) >= 8 and _finite_float(edge.get("avg_return"), -1) > 0,
+        "戦略損益": _finite_float(pm.get("cagr"), -1) > 0 and _finite_float(pm.get("sharpe"), -9) > 0,
+        "情報品質": _finite_float(result.get("source_conf"), 0) >= 0.65 and _finite_float(result.get("coverage"), 0) >= 0.65,
+        "市場環境": regime.get("state") != "弱気",
+    }
+    passed = int(sum(bool(v) for v in checks.values()))
+    grade = "A" if passed >= 6 else ("B" if passed >= 5 else ("C" if passed >= 4 else "D"))
+    return {"grade": grade, "passed": passed, "total": len(checks), "checks": checks, "edge": edge, "regime": regime}
+
+
+def build_trade_plan(result: Dict) -> Dict[str, object]:
+    """Translate the analytical result into a conservative, daily-bar trade plan.
+
+    Prices are reference levels derived from confirmed daily OHLC data. They are not
+    real-time quotes and intentionally avoid telling the user to chase a gap-up open.
+    """
+    f = result.get("features", pd.DataFrame())
+    if f is None or f.empty:
+        return {}
+    f = f.dropna(subset=["Close"]).copy()
+    if f.empty:
+        return {}
+    row = f.iloc[-1]
+    close = _finite_float(row.get("Close"), 0.0)
+    if close <= 0:
+        return {}
+    atr_v = _finite_float(row.get("atr_14"), close * 0.03)
+    atr_v = max(atr_v, close * 0.005)
+    sma20 = _finite_float(row.get("sma_20"), np.nan)
+    sma50 = _finite_float(row.get("sma_50"), np.nan)
+    rsi_v = _finite_float(row.get("rsi_14"), 50.0)
+    score = _finite_float(result.get("score"), 0.0)
+    p_up = _finite_float(result.get("live_p"), 0.5)
+    conf = _finite_float(result.get("confidence"), 0.0)
+    phase = str(result.get("phase", "中立・監視"))
+    event_risk = bool(result.get("event_risk", False))
+
+    # Entry zone: phase-specific and deliberately conservative.
+    if phase == "初動候補":
+        entry_low, entry_high = close - 0.55 * atr_v, close + 0.15 * atr_v
+    elif phase == "押し目候補" and np.isfinite(sma20):
+        anchor = sma20
+        entry_low, entry_high = anchor - 0.35 * atr_v, anchor + 0.35 * atr_v
+    elif phase == "上昇継続":
+        entry_low, entry_high = close - 0.85 * atr_v, close - 0.20 * atr_v
+    elif phase == "底打ち候補":
+        entry_low, entry_high = close - 0.55 * atr_v, close + 0.10 * atr_v
+    elif phase == "過熱警戒":
+        entry_low, entry_high = close - 1.55 * atr_v, close - 0.75 * atr_v
+    else:
+        entry_low, entry_high = close - 0.75 * atr_v, close - 0.15 * atr_v
+
+    entry_low = max(entry_low, close * 0.70)
+    entry_high = max(entry_high, entry_low + max(close * 0.002, 0.01))
+    entry_mid = (entry_low + entry_high) / 2.0
+
+    # Structural stop: nearest reasonable support below the entry zone, bounded to
+    # roughly 3-10% risk so a single odd candle cannot create an absurd stop.
+    recent10_low = _finite_float(f["Low"].tail(10).min() if "Low" in f else np.nan, np.nan)
+    candidates = [entry_low - 1.15 * atr_v]
+    if np.isfinite(recent10_low) and recent10_low < entry_low:
+        candidates.append(recent10_low - 0.20 * atr_v)
+    if np.isfinite(sma20) and sma20 < entry_low:
+        candidates.append(sma20 - 0.65 * atr_v)
+    if np.isfinite(sma50) and sma50 < entry_low:
+        candidates.append(sma50 - 0.35 * atr_v)
+    structural = max([x for x in candidates if np.isfinite(x) and x < entry_low], default=entry_low - 1.5 * atr_v)
+    stop = float(np.clip(structural, entry_mid * 0.90, entry_mid * 0.97))
+    if stop >= entry_low:
+        stop = min(entry_low - 0.35 * atr_v, entry_mid * 0.97)
+    stop = max(stop, 0.01)
+
+    risk = max(entry_mid - stop, close * 0.01)
+    recent20_high = _finite_float(f["High"].tail(20).max() if "High" in f else np.nan, np.nan)
+    target1 = entry_mid + 1.6 * risk
+    if np.isfinite(recent20_high) and recent20_high > entry_mid:
+        target1 = max(target1, recent20_high)
+    target2 = entry_mid + 2.6 * risk
+    target2 = max(target2, target1 + 0.6 * risk)
+
+    ready = practical_readiness(result)
+    edge = ready["edge"]
+    regime = ready["regime"]
+    dynamic_p = max(0.54, float(edge.get("threshold", 0.60)))
+    if event_risk or phase in {"売り警戒", "下落基調", "過熱警戒"}:
+        decision = "見送り"
+    elif regime.get("state") == "弱気":
+        decision = "監視"
+    elif score >= 86 and p_up >= dynamic_p and conf >= 0.60 and ready["grade"] in {"A", "B"}:
+        decision = "買い候補"
+    elif score >= 80 and p_up >= max(0.54, dynamic_p - 0.03) and conf >= 0.55 and ready["grade"] in {"A", "B", "C"}:
+        decision = "条件付き買い"
+    elif score >= 72:
+        decision = "監視"
+    else:
+        decision = "見送り"
+
+    if decision in {"買い候補", "条件付き買い"}:
+        if close > entry_high:
+            timing = "押し目待ち（上値を追わない）"
+        elif close < entry_low:
+            timing = "反発確認待ち"
+        else:
+            timing = "買いゾーン内"
+    elif decision == "監視":
+        timing = "まだ買わない"
+    else:
+        timing = "新規買い見送り"
+
+    # If momentum is stretched, prohibit chasing even if the aggregate score is high.
+    if rsi_v >= 72 and decision in {"買い候補", "条件付き買い"}:
+        timing = "押し目待ち（RSI高め）"
+
+    rr1 = (target1 - entry_mid) / max(entry_mid - stop, 1e-9)
+    rr2 = (target2 - entry_mid) / max(entry_mid - stop, 1e-9)
+    risk_budget = float(account_capital) * float(risk_per_trade_pct) / 100.0
+    risk_per_share = max(entry_mid - stop, 0.01)
+    shares_risk = int(risk_budget // (risk_per_share * 100)) * 100
+    shares_alloc = int((float(account_capital) * float(max_position_pct) / 100.0) // (entry_mid * 100)) * 100
+    suggested_shares = max(0, min(shares_risk, shares_alloc))
+    position_value = suggested_shares * entry_mid
+    estimated_loss = suggested_shares * risk_per_share
+    base_date = pd.Timestamp(f.index[-1]).date().isoformat()
+    return {
+        "判定": decision,
+        "買いタイミング": timing,
+        "基準日": base_date,
+        "基準終値": round(close, 1),
+        "買い下限": round(entry_low, 1),
+        "買い上限": round(entry_high, 1),
+        "損切り": round(stop, 1),
+        "利確1": round(target1, 1),
+        "利確2": round(target2, 1),
+        "RR1": round(rr1, 2),
+        "RR2": round(rr2, 2),
+        "市場環境": regime.get("state", "不明"),
+        "市場環境点": regime.get("score", 50.0),
+        "実戦準備度": ready.get("grade", "D"),
+        "準備通過": f"{ready.get('passed',0)}/{ready.get('total',6)}",
+        "AI必要確率": round(dynamic_p * 100, 1),
+        "OOS期待値": edge.get("avg_return", np.nan),
+        "OOS件数": edge.get("n", 0),
+        "推奨株数": suggested_shares,
+        "想定投資額": round(position_value, 0),
+        "想定最大損失": round(estimated_loss, 0),
+        "売りルール": f"{stop:,.1f}円割れで撤退。{target1:,.1f}円で半分利確後、残りの損切りを建値近辺へ引き上げ、{target2:,.1f}円または終値が20日線を明確に割れたら利確/縮小。",
+    }
+
+
+def render_trade_plan(result: Dict, title: str = "売買プラン") -> None:
+    plan = build_trade_plan(result)
+    if not plan:
+        st.info("売買プランを計算できる価格データが不足しています。")
+        return
+    st.markdown(f"### {title}")
+    decision = str(plan["判定"])
+    timing = str(plan["買いタイミング"])
+    if decision == "買い候補":
+        st.success(f"**判定：{decision}** ｜ {timing}")
+    elif decision == "条件付き買い":
+        st.warning(f"**判定：{decision}** ｜ {timing}")
+    elif decision == "監視":
+        st.info(f"**判定：{decision}** ｜ {timing}")
+    else:
+        st.error(f"**判定：{decision}** ｜ {timing}")
+    st.markdown(
+        f"**買い目安：{plan['買い下限']:,.1f}〜{plan['買い上限']:,.1f}円**  ｜  "
+        f"損切り：**{plan['損切り']:,.1f}円**  ｜  利確①：**{plan['利確1']:,.1f}円**  ｜  利確②：**{plan['利確2']:,.1f}円**"
+    )
+    st.markdown(f"**資金管理例**：推奨 **{int(plan['推奨株数']):,}株** ｜ 投資額 約**{plan['想定投資額']:,.0f}円** ｜ 損切り時の想定損失 約**{plan['想定最大損失']:,.0f}円**")
+    oos = plan.get("OOS期待値", np.nan)
+    oos_txt = f"{oos:+.1%}" if np.isfinite(_finite_float(oos, np.nan)) else "未判定"
+    st.caption(f"基準日 {plan['基準日']}・終値 {plan['基準終値']:,.1f}円。市場環境 {plan['市場環境']}({plan['市場環境点']:.0f}点) / 実戦準備度 {plan['実戦準備度']}({plan['準備通過']}) / OOS期待値 {oos_txt}・n={plan['OOS件数']} / AI必要確率 {plan['AI必要確率']:.1f}% / RR ①{plan['RR1']:.2f} ②{plan['RR2']:.2f}。")
+    st.caption("J-Quants Standard単体の本システムは確定日足を基準にします。J-Quantsには分足・Tickの有料アドオンもありますが日次配信でリアルタイム配信ではないため、この価格はリアルタイム注文価格ではありません。寄付きが買い上限を超える場合は追いかけず再判定します。")
+    st.caption(str(plan["売りルール"]))
 
 
 def component_table(result: Dict) -> pd.DataFrame:
@@ -542,6 +817,8 @@ with main_tab:
         sq = float(r.get("supply_summary", {}).get("supply_demand_quality", 50.0))
         headline[5].metric("需給スコア", f"{sq:.1f}/100")
 
+        render_trade_plan(r, "この銘柄の売買プラン")
+
         detail_tabs = st.tabs(["100点内訳", "需給詳細", "チャート", "AI検証", "情報源監査", "重要開示"])
         with detail_tabs[0]:
             ct = component_table(r)
@@ -625,8 +902,8 @@ with main_tab:
 
 
 with market_tab:
-    st.subheader("今日の日本株レーダー")
-    st.caption("東証プライム・スタンダード・グロースの普通株を公式J-Quantsデータで横断スキャンします。一次選別は高速レーダー、その後に上位銘柄だけを最終100点評価します。")
+    st.subheader("本日の日本株レーダー（前営業日確定データ基準）")
+    st.caption("東証プライム・スタンダード・グロースの普通株を公式J-Quantsデータで横断スキャンします。V8は高得点だけで買わず、市場環境・OOS優位性・リスク量を通過した候補だけを『買い候補』にします。")
 
     mc1, mc2, mc3, mc4 = st.columns(4)
     radar_days = mc1.selectbox("全市場履歴", [330, 390, 450], index=1, format_func=lambda x: f"約{x}暦日")
@@ -637,7 +914,8 @@ with market_tab:
     st.info("初回だけ過去の全市場日次データを公式APIから収集します。取得済み日付はサーバー側にキャッシュするため、2回目以降は差分中心になります。")
     st.caption("データ範囲はJ-Quants契約プランに連動します。Light以上で現在株価、Standard以上で信用・空売り、Premiumで売買内訳が追加されます。取得できない項目は推測せず、需給充足度を下げて評価します。")
 
-    if st.button("今日の買い候補を更新", type="primary", use_container_width=True, key="all_market_scan"):
+    if st.button("本日の結論を更新（全市場→100点→実戦ゲート→売買プラン）", type="primary", use_container_width=True, key="all_market_scan"):
+        st.session_state["auto_deep_scan_requested"] = False
         if not jq_connected:
             st.error("J-Quants APIへ正常接続できていません。画面上部の接続状態を確認してください。")
         elif not jq_live_eligible:
@@ -689,6 +967,7 @@ with market_tab:
                 st.session_state["market_radar"] = radar
                 st.session_state["market_listed"] = universe
                 st.session_state["market_scan_stats"] = stats
+                st.session_state["auto_deep_scan_requested"] = True
                 progress.empty()
             except Exception as e:
                 progress.empty()
@@ -717,33 +996,36 @@ with market_tab:
         for c in ["20日騰落", "60日騰落"]:
             if c in display.columns:
                 display[c] = display[c] * 100
-        st.dataframe(
-            display,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "先回りレーダー": st.column_config.ProgressColumn("先回りレーダー", min_value=0, max_value=100, format="%.1f"),
-                "価格レーダー": st.column_config.ProgressColumn("価格レーダー", min_value=0, max_value=100, format="%.1f"),
-                "需給スコア": st.column_config.ProgressColumn("需給スコア", min_value=0, max_value=100, format="%.1f"),
-                "需給充足": st.column_config.ProgressColumn("需給充足", min_value=0, max_value=1, format="%.0f%%"),
-                "1日変化": st.column_config.NumberColumn("1日変化", format="%+.1f"),
-                "5日変化": st.column_config.NumberColumn("5日変化", format="%+.1f"),
-                "20日騰落": st.column_config.NumberColumn("20日騰落", format="%+.1f%%"),
-                "60日騰落": st.column_config.NumberColumn("60日騰落", format="%+.1f%%"),
-                "売買代金比": st.column_config.NumberColumn("売買代金比", format="%.2fx"),
-                "売買代金": st.column_config.NumberColumn("売買代金", format="%,.0f"),
-            },
-        )
+        with st.expander("一次レーダー詳細（上級者向け・上位100件）", expanded=False):
+            st.dataframe(
+                display,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "先回りレーダー": st.column_config.ProgressColumn("先回りレーダー", min_value=0, max_value=100, format="%.1f"),
+                    "価格レーダー": st.column_config.ProgressColumn("価格レーダー", min_value=0, max_value=100, format="%.1f"),
+                    "需給スコア": st.column_config.ProgressColumn("需給スコア", min_value=0, max_value=100, format="%.1f"),
+                    "需給充足": st.column_config.ProgressColumn("需給充足", min_value=0, max_value=1, format="%.0f%%"),
+                    "1日変化": st.column_config.NumberColumn("1日変化", format="%+.1f"),
+                    "5日変化": st.column_config.NumberColumn("5日変化", format="%+.1f"),
+                    "20日騰落": st.column_config.NumberColumn("20日騰落", format="%+.1f%%"),
+                    "60日騰落": st.column_config.NumberColumn("60日騰落", format="%+.1f%%"),
+                    "売買代金比": st.column_config.NumberColumn("売買代金比", format="%.2fx"),
+                    "売買代金": st.column_config.NumberColumn("売買代金", format="%,.0f"),
+                },
+            )
 
         rr1, rr2, rr3, rr4 = st.columns(4)
-        rr1.metric("需給先回り", int((radar["early_signal"] == "需給先回り候補").sum()))
-        rr2.metric("初動候補", int((radar["early_signal"] == "初動レーダー").sum()))
-        rr3.metric("押し目候補", int((radar["early_signal"] == "押し目レーダー").sum()))
+        rr1.metric("需給先回り候補数", int((radar["early_signal"] == "需給先回り候補").sum()))
+        rr2.metric("初動候補数", int((radar["early_signal"] == "初動レーダー").sum()))
+        rr3.metric("押し目候補数", int((radar["early_signal"] == "押し目レーダー").sum()))
         rr4.metric("先回り80点以上", int((radar["early_radar_score"] >= 80).sum()))
 
         st.markdown("### 上位候補を最終100点評価")
         st.caption("ここからは価格だけでなく、財務・AIのWalk-forward検証・情報信頼度を含めて再評価します。最終100点ランキングはこちらの結果を採用してください。")
-        if st.button(f"上位 {deep_n} 銘柄を精査", type="secondary", use_container_width=True, key="deep_scan_top"):
+        manual_deep = st.button(f"上位 {deep_n} 銘柄を再精査", type="secondary", use_container_width=True, key="deep_scan_top")
+        auto_deep = bool(st.session_state.pop("auto_deep_scan_requested", False))
+        if manual_deep or auto_deep:
             candidates = visible.head(int(deep_n))["Code"].astype(str).tolist()
             if not candidates:
                 st.warning("優先レーダー条件に該当する候補がありません。フィルターを広げてください。")
@@ -781,9 +1063,12 @@ with market_tab:
                         # Batch deep scan skips the separate EDINET document crawl for speed, but J-Quants official buyback/market data are included.
                         res = analyze_one(scode, px, bm, fundamentals, macro, statuses, pd.DataFrame(), ss)
                         rr = radar[radar["Code"].astype(str) == scode].head(1)
+                        plan = build_trade_plan(res)
                         final_rows.append({
                             "Code": scode,
                             "会社名": name_map.get(scode, ""),
+                            "判定": plan.get("判定", ""),
+                            "買いタイミング": plan.get("買いタイミング", ""),
                             "買い候補100点": res["score"],
                             "前回比": res["score_change"],
                             "相場フェーズ": res["phase"],
@@ -794,6 +1079,21 @@ with market_tab:
                             "需給判定": ss.get("supply_demand_signal", ""),
                             "20日騰落%": round(res["features"]["ret_20"].iloc[-1] * 100, 1),
                             "売買代金比": round(res["features"]["turnover_ratio_20"].iloc[-1], 2),
+                            "基準日": plan.get("基準日", ""),
+                            "基準終値": plan.get("基準終値", np.nan),
+                            "買い下限": plan.get("買い下限", np.nan),
+                            "買い上限": plan.get("買い上限", np.nan),
+                            "損切り": plan.get("損切り", np.nan),
+                            "利確1": plan.get("利確1", np.nan),
+                            "利確2": plan.get("利確2", np.nan),
+                            "RR1": plan.get("RR1", np.nan),
+                            "市場環境": plan.get("市場環境", ""),
+                            "実戦準備度": plan.get("実戦準備度", ""),
+                            "OOS期待値%": round(_finite_float(plan.get("OOS期待値"), np.nan) * 100, 2) if np.isfinite(_finite_float(plan.get("OOS期待値"), np.nan)) else np.nan,
+                            "OOS件数": plan.get("OOS件数", 0),
+                            "推奨株数": plan.get("推奨株数", 0),
+                            "想定投資額": plan.get("想定投資額", 0),
+                            "想定最大損失": plan.get("想定最大損失", 0),
                             "評価": res["label"],
                         })
                     except Exception as e:
@@ -803,22 +1103,69 @@ with market_tab:
                 st.session_state["deep_market_rank"] = final_rank
 
         if "deep_market_rank" in st.session_state:
-            final_rank = st.session_state["deep_market_rank"]
-            st.dataframe(
-                final_rank,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "買い候補100点": st.column_config.ProgressColumn("買い候補100点", min_value=0, max_value=100, format="%.1f"),
-                    "前回比": st.column_config.NumberColumn("前回比", format="%+.1f"),
-                    f"AI {horizon}日上昇確率": st.column_config.ProgressColumn(f"AI {horizon}日上昇確率", min_value=0, max_value=100, format="%.1f%%"),
-                    "総合信頼度": st.column_config.ProgressColumn("総合信頼度", min_value=0, max_value=100, format="%.1f%%"),
-                    "先回りレーダー": st.column_config.ProgressColumn("先回りレーダー", min_value=0, max_value=100, format="%.1f"),
-                    "需給スコア": st.column_config.ProgressColumn("需給スコア", min_value=0, max_value=100, format="%.1f"),
-                },
-            )
-            st.download_button("最終100点ランキングCSVを保存", final_rank.to_csv(index=False).encode("utf-8-sig"), file_name="japan_stock_final_100_ranking.csv", mime="text/csv", key="download_deep")
-            st.warning("最終売買前は、上位候補を『個別銘柄』タブで開き、EDINET重要開示まで確認してください。")
+            final_rank = st.session_state["deep_market_rank"].copy()
+            st.markdown("## 今日の結論")
+            st.caption("最終100点評価とAI・需給を通過した上位候補です。価格はJ-Quantsの確定日足から計算した目安で、リアルタイム気配ではありません。")
+            priority = {"買い候補": 0, "条件付き買い": 1, "監視": 2, "見送り": 3}
+            if "判定" in final_rank.columns:
+                final_rank["_priority"] = final_rank["判定"].map(priority).fillna(9)
+                actionable = final_rank[final_rank["判定"].isin(["買い候補", "条件付き買い"])].copy()
+                conclusion = actionable.sort_values(["_priority", "買い候補100点", "前回比"], ascending=[True, False, False], na_position="last").head(5)
+            else:
+                conclusion = pd.DataFrame()
+            if conclusion.empty:
+                st.info("**本日は新規買いなし**。実戦ゲートを通過した銘柄がありません。条件を緩めて無理に買わないことをV8の正式な判断とします。")
+            else:
+                for rank_no, (_, row_) in enumerate(conclusion.iterrows(), 1):
+                    code_ = str(row_.get("Code", ""))
+                    name_ = str(row_.get("会社名", ""))
+                    decision_ = str(row_.get("判定", "監視"))
+                    timing_ = str(row_.get("買いタイミング", ""))
+                    score_ = _finite_float(row_.get("買い候補100点"), np.nan)
+                    ai_ = _finite_float(row_.get(f"AI {horizon}日上昇確率"), np.nan)
+                    line1 = f"**{rank_no}位　{code_} {name_}｜{decision_}**　{score_:.1f}点 / AI上昇確率 {ai_:.1f}%"
+                    details = (
+                        f"{timing_}　｜　買い目安 **{_finite_float(row_.get('買い下限')):,.1f}〜{_finite_float(row_.get('買い上限')):,.1f}円**　｜　"
+                        f"損切り **{_finite_float(row_.get('損切り')):,.1f}円**　｜　利確① **{_finite_float(row_.get('利確1')):,.1f}円**　｜　利確② **{_finite_float(row_.get('利確2')):,.1f}円**\n\n"
+                        f"市場 **{row_.get('市場環境','')}** ｜ 実戦準備度 **{row_.get('実戦準備度','')}** ｜ OOS期待値 **{_finite_float(row_.get('OOS期待値%'), np.nan):+.2f}%** (n={int(_finite_float(row_.get('OOS件数'),0))}) ｜ 推奨 **{int(_finite_float(row_.get('推奨株数'),0)):,}株**"
+                    )
+                    if decision_ == "買い候補":
+                        st.success(line1 + "\n\n" + details)
+                    elif decision_ == "条件付き買い":
+                        st.warning(line1 + "\n\n" + details)
+                    elif decision_ == "監視":
+                        st.info(line1 + "\n\n" + details)
+                    else:
+                        st.error(line1 + "\n\n" + details)
+            st.caption("売りの基本：損切りに達したら撤退。利確①で半分を落とし、残りのストップを建値近辺へ引き上げます。利確②または20日線割れで残りを縮小。寄付きが買い上限より上なら追い買いしません。")
+
+            with st.expander("最終100点ランキング詳細", expanded=False):
+                show_rank = final_rank.drop(columns=["_priority"], errors="ignore")
+                st.dataframe(
+                    show_rank,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "買い候補100点": st.column_config.ProgressColumn("買い候補100点", min_value=0, max_value=100, format="%.1f"),
+                        "前回比": st.column_config.NumberColumn("前回比", format="%+.1f"),
+                        f"AI {horizon}日上昇確率": st.column_config.ProgressColumn(f"AI {horizon}日上昇確率", min_value=0, max_value=100, format="%.1f%%"),
+                        "総合信頼度": st.column_config.ProgressColumn("総合信頼度", min_value=0, max_value=100, format="%.1f%%"),
+                        "先回りレーダー": st.column_config.ProgressColumn("先回りレーダー", min_value=0, max_value=100, format="%.1f"),
+                        "需給スコア": st.column_config.ProgressColumn("需給スコア", min_value=0, max_value=100, format="%.1f"),
+                        "基準終値": st.column_config.NumberColumn("基準終値", format="%,.1f円"),
+                        "買い下限": st.column_config.NumberColumn("買い下限", format="%,.1f円"),
+                        "買い上限": st.column_config.NumberColumn("買い上限", format="%,.1f円"),
+                        "損切り": st.column_config.NumberColumn("損切り", format="%,.1f円"),
+                        "利確1": st.column_config.NumberColumn("利確1", format="%,.1f円"),
+                        "利確2": st.column_config.NumberColumn("利確2", format="%,.1f円"),
+                        "OOS期待値%": st.column_config.NumberColumn("OOS期待値", format="%+.2f%%"),
+                        "推奨株数": st.column_config.NumberColumn("推奨株数", format="%,d株"),
+                        "想定投資額": st.column_config.NumberColumn("想定投資額", format="%,.0f円"),
+                        "想定最大損失": st.column_config.NumberColumn("想定最大損失", format="%,.0f円"),
+                    },
+                )
+            st.download_button("最終100点ランキングCSVを保存", final_rank.drop(columns=["_priority"], errors="ignore").to_csv(index=False).encode("utf-8-sig"), file_name="japan_stock_final_100_ranking_v74.csv", mime="text/csv", key="download_deep")
+            st.warning("最終売買前は、上位候補を『個別』タブで開き、重要開示・決算日も確認してください。売買プランは確定日足ベースの参考値であり、利益を保証するものではありません。")
 
 with scanner_tab:
     st.subheader("最終100点ランキング")
@@ -954,6 +1301,28 @@ with validation_tab:
                 st.dataframe(show, use_container_width=True, hide_index=True)
                 st.markdown("**読み方**: 勝率だけでなく、平均騰落率・TOPIX等に対する超過リターン・シグナル後の平均最大不利変動を同時に見ます。A/B判定でも将来利益を保証するものではありません。")
 
+                st.markdown("### 現実約定テスト（V8）")
+                st.caption("シグナル日の終値では買えたことにせず、翌営業日の始値で約定。大幅ギャップアップは見送り、ストップと利確が同日に両方触れた場合は保守的にストップ先行として計算します。手数料＋スリッページも差し引きます。")
+                trades = execution_trade_backtest(
+                    vh, vr["px"], horizon=int(horizon), transaction_cost_bps=float(tx_cost),
+                    slippage_bps=float(slippage_bps), cooldown=int(cooldown),
+                )
+                em = execution_metrics(trades)
+                eg = execution_grade(em)
+                e1,e2,e3,e4,e5 = st.columns(5)
+                e1.metric("実戦検証", eg["grade"])
+                e2.metric("約定件数", f"{int(em.get('trades',0))}件")
+                e3.metric("勝率", f"{_finite_float(em.get('win_rate'),0):.1%}")
+                e4.metric("1回平均", f"{_finite_float(em.get('expectancy'),0):+.2%}")
+                pfv = _finite_float(em.get('profit_factor'), np.nan)
+                e5.metric("Profit Factor", f"{pfv:.2f}" if np.isfinite(pfv) else "-")
+                cil = _finite_float(em.get('mean_ci10'), np.nan); cih = _finite_float(em.get('mean_ci90'), np.nan)
+                if np.isfinite(cil) and np.isfinite(cih):
+                    st.caption(f"平均損益のブートストラップ80%範囲: {cil:+.2%} ～ {cih:+.2%}。下限がマイナスなら、利益が出ていても確証は弱いと扱います。")
+                if trades is not None and not trades.empty:
+                    with st.expander("現実約定テスト明細"):
+                        st.dataframe(trades.sort_values("SignalDate", ascending=False), use_container_width=True, hide_index=True)
+
             if events is not None and not events.empty:
                 ev_show = events.sort_values("Date", ascending=False).copy()
                 for c in [x for x in ev_show.columns if x.startswith("ret_") or x.startswith("excess_") or x.startswith("mae_")]:
@@ -963,7 +1332,7 @@ with validation_tab:
                     st.download_button("検証結果CSVを保存", events.to_csv(index=False).encode("utf-8-sig"), file_name=f"validation_{vr['code']}.csv", mime="text/csv")
 
 with adaptive_tab:
-    st.subheader("V7 適応配点エンジン")
+    st.subheader("V8 適応配点エンジン")
     st.caption("過去データのアウト・オブ・サンプル成績から、価格・需給系の配点を学習します。過学習を避けるため、学習結果は従来配点へ65%縮小して採用します。")
     if "latest_result" not in st.session_state:
         st.info("まず『🔎 個別』で銘柄を分析してください。その銘柄の履歴から適応配点を検証できます。")
@@ -980,11 +1349,11 @@ with adaptive_tab:
             c1.metric("状態", opt.get("status",""))
             c2.metric("検証AUC", f"{m.get('auc', float('nan')):.3f}" if m else "-")
             c3.metric("Balanced Acc", f"{m.get('balanced_accuracy', float('nan')):.3f}" if m else "-")
-            df=pd.DataFrame({"項目":list(opt["weights"].keys()),"V7推奨配点":list(opt["weights"].values()),"従来配点":[BASELINE_WEIGHTS[k] for k in opt["weights"]]})
-            df["差"] = df["V7推奨配点"]-df["従来配点"]
+            df=pd.DataFrame({"項目":list(opt["weights"].keys()),"V8推奨配点":list(opt["weights"].values()),"従来配点":[BASELINE_WEIGHTS[k] for k in opt["weights"]]})
+            df["差"] = df["V8推奨配点"]-df["従来配点"]
             st.dataframe(df, use_container_width=True, hide_index=True)
             if opt.get("status") != "optimized":
-                st.warning("検証力が不足しているため、V7は従来配点を維持します。無理に最適化しません。")
+                st.warning("検証力が不足しているため、V8は従来配点を維持します。無理に最適化しません。")
 
 with guide_tab:
     st.subheader("100点の配点")
@@ -1014,4 +1383,4 @@ with guide_tab:
     """)
 
 st.divider()
-st.caption("本システムは売買判断支援ツールです。将来の利益を保証するものではありません。最終判断では決算日、流動性、板、ギャップ、ストップ高/安、税・手数料も確認してください。")
+st.caption("V8の原則：高得点でも、弱い市場・弱いOOS検証・過大なリスクなら買いません。Standard単体では確定日足を基準にし、リアルタイム気配としては扱いません。本システムは売買判断支援ツールで、利益を保証するものではありません。")
