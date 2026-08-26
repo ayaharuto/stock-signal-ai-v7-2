@@ -43,7 +43,7 @@ from sources import (
     source_confidence,
 )
 
-st.set_page_config(page_title="Stock Signal AI v8.0", page_icon="📈", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Stock Signal AI v8.0.1", page_icon="📈", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown(
     """
@@ -69,7 +69,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("Stock Signal AI v8.0")
+st.title("Stock Signal AI v8.0.1")
 st.caption("個人向けJ-Quants API V2対応。V8は『当てる』だけでなく、**市場環境・アウトオブサンプル優位性・資金管理・現実的な約定検証**を通過した銘柄だけを実戦候補にします。取得できないデータは推測で埋めません。")
 
 def _safe_secret(name: str, default: str = "") -> str:
@@ -1097,19 +1097,86 @@ with market_tab:
                             "評価": res["label"],
                         })
                     except Exception as e:
-                        final_rows.append({"Code": scode, "会社名": name_map.get(scode, ""), "買い候補100点": np.nan, "相場フェーズ": f"分析失敗: {str(e)[:45]}"})
+                        # A single candidate must never crash the whole market scan.
+                        # Keep the row shape stable so DataFrame construction/sorting is safe even
+                        # when every candidate failed (e.g. temporary API/plan/data issue).
+                        err = _sanitize_api_error(e)[:180]
+                        final_rows.append({
+                            "Code": scode,
+                            "会社名": name_map.get(scode, ""),
+                            "判定": "見送り",
+                            "買いタイミング": "分析エラーのため見送り",
+                            "買い候補100点": np.nan,
+                            "前回比": np.nan,
+                            "相場フェーズ": "分析失敗",
+                            f"AI {horizon}日上昇確率": np.nan,
+                            "総合信頼度": np.nan,
+                            "先回りレーダー": np.nan,
+                            "需給スコア": np.nan,
+                            "需給判定": "未判定",
+                            "20日騰落%": np.nan,
+                            "売買代金比": np.nan,
+                            "基準日": "",
+                            "基準終値": np.nan,
+                            "買い下限": np.nan,
+                            "買い上限": np.nan,
+                            "損切り": np.nan,
+                            "利確1": np.nan,
+                            "利確2": np.nan,
+                            "RR1": np.nan,
+                            "市場環境": "未判定",
+                            "実戦準備度": "D",
+                            "OOS期待値%": np.nan,
+                            "OOS件数": 0,
+                            "推奨株数": 0,
+                            "想定投資額": 0,
+                            "想定最大損失": 0,
+                            "評価": "分析失敗",
+                            "分析エラー": err,
+                        })
                 dprog.empty()
-                final_rank = pd.DataFrame(final_rows).sort_values(["買い候補100点", "前回比"], ascending=[False, False], na_position="last")
+                final_rank = pd.DataFrame(final_rows)
+                # Defensive schema: a failed batch can otherwise have no sort columns at all.
+                required_defaults = {
+                    "買い候補100点": np.nan, "前回比": np.nan, "判定": "見送り",
+                    "会社名": "", "相場フェーズ": "分析失敗", "分析エラー": "",
+                }
+                for col, default in required_defaults.items():
+                    if col not in final_rank.columns:
+                        final_rank[col] = default
+                if not final_rank.empty:
+                    final_rank = final_rank.sort_values(
+                        ["買い候補100点", "前回比"],
+                        ascending=[False, False],
+                        na_position="last",
+                    )
+                ok_n = int(pd.to_numeric(final_rank["買い候補100点"], errors="coerce").notna().sum()) if not final_rank.empty else 0
+                fail_n = int(len(final_rank) - ok_n)
                 st.session_state["deep_market_rank"] = final_rank
+                st.session_state["deep_market_scan_counts"] = {"ok": ok_n, "failed": fail_n}
 
         if "deep_market_rank" in st.session_state:
             final_rank = st.session_state["deep_market_rank"].copy()
+            counts = st.session_state.get("deep_market_scan_counts", {})
+            ok_n = int(counts.get("ok", pd.to_numeric(final_rank.get("買い候補100点", pd.Series(dtype=float)), errors="coerce").notna().sum()))
+            fail_n = int(counts.get("failed", max(len(final_rank) - ok_n, 0)))
+            if fail_n:
+                if ok_n == 0:
+                    st.error("最終精査した銘柄を正常評価できませんでした。買い判断は出さず、下のエラー概要を確認してください。")
+                else:
+                    st.warning(f"最終精査 {ok_n}銘柄成功 / {fail_n}銘柄失敗。失敗銘柄は自動的に見送り扱いです。")
+                if "分析エラー" in final_rank.columns:
+                    err_view = final_rank.loc[final_rank["分析エラー"].fillna("").astype(str).ne(""), [c for c in ["Code", "会社名", "分析エラー"] if c in final_rank.columns]].head(10)
+                    if not err_view.empty:
+                        with st.expander("失敗理由を確認（APIキー等の秘密情報は表示しません）"):
+                            st.dataframe(err_view, use_container_width=True, hide_index=True)
             st.markdown("## 今日の結論")
             st.caption("最終100点評価とAI・需給を通過した上位候補です。価格はJ-Quantsの確定日足から計算した目安で、リアルタイム気配ではありません。")
             priority = {"買い候補": 0, "条件付き買い": 1, "監視": 2, "見送り": 3}
             if "判定" in final_rank.columns:
                 final_rank["_priority"] = final_rank["判定"].map(priority).fillna(9)
-                actionable = final_rank[final_rank["判定"].isin(["買い候補", "条件付き買い"])].copy()
+                score_num = pd.to_numeric(final_rank.get("買い候補100点", pd.Series(index=final_rank.index, dtype=float)), errors="coerce")
+                actionable = final_rank[final_rank["判定"].isin(["買い候補", "条件付き買い"]) & score_num.notna()].copy()
                 conclusion = actionable.sort_values(["_priority", "買い候補100点", "前回比"], ascending=[True, False, False], na_position="last").head(5)
             else:
                 conclusion = pd.DataFrame()
