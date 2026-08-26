@@ -43,7 +43,7 @@ from sources import (
     source_confidence,
 )
 
-st.set_page_config(page_title="Stock Signal AI v8.0.1", page_icon="📈", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Stock Signal AI v8.0.3", page_icon="📈", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown(
     """
@@ -69,7 +69,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("Stock Signal AI v8.0.1")
+st.title("Stock Signal AI v8.0.3")
 st.caption("個人向けJ-Quants API V2対応。V8は『当てる』だけでなく、**市場環境・アウトオブサンプル優位性・資金管理・現実的な約定検証**を通過した銘柄だけを実戦候補にします。取得できないデータは推測で埋めません。")
 
 def _safe_secret(name: str, default: str = "") -> str:
@@ -629,10 +629,75 @@ def build_trade_plan(result: Dict) -> Dict[str, object]:
     risk_per_share = max(entry_mid - stop, 0.01)
     shares_risk = int(risk_budget // (risk_per_share * 100)) * 100
     shares_alloc = int((float(account_capital) * float(max_position_pct) / 100.0) // (entry_mid * 100)) * 100
-    suggested_shares = max(0, min(shares_risk, shares_alloc))
+    conditional_shares = max(0, min(shares_risk, shares_alloc))
+
+    # V8.0.3: a position size is an ACTION only when both the practical gate and the
+    # price gate are satisfied.  Watch/skip names must never look like an order suggestion.
+    execution_ready = bool(decision in {"買い候補", "条件付き買い"} and timing == "買いゾーン内")
+    suggested_shares = conditional_shares if execution_ready else 0
     position_value = suggested_shares * entry_mid
     estimated_loss = suggested_shares * risk_per_share
     base_date = pd.Timestamp(f.index[-1]).date().isoformat()
+
+    # Short, human-readable reason/next condition for the first screen and exported CSV.
+    blockers = []
+    upgrade = []
+    cond_threshold = max(0.54, dynamic_p - 0.03)
+    if event_risk:
+        blockers.append("重要開示リスクあり")
+        upgrade.append("開示内容を確認しイベントリスク解消")
+    if phase in {"売り警戒", "下落基調", "過熱警戒"}:
+        blockers.append(f"相場フェーズ={phase}")
+        upgrade.append("過熱/下落警戒から離脱")
+    if regime.get("state") == "弱気":
+        blockers.append("市場環境が弱気")
+        upgrade.append("市場環境が中立以上へ改善")
+    if score < 80:
+        blockers.append(f"100点評価 {score:.1f}点（条件付き買い目安80点未満）")
+        upgrade.append("100点評価80点以上")
+    if p_up < cond_threshold:
+        blockers.append(f"AI上昇確率 {p_up*100:.1f}%（必要 {cond_threshold*100:.1f}%）")
+        upgrade.append(f"AI上昇確率{cond_threshold*100:.1f}%以上")
+    if conf < 0.55:
+        blockers.append(f"総合信頼度 {conf*100:.1f}%（目安55%未満）")
+        upgrade.append("総合信頼度55%以上")
+    if ready["grade"] not in {"A", "B", "C"}:
+        blockers.append(f"実戦準備度 {ready['grade']}")
+        upgrade.append("実戦準備度C以上")
+    if int(edge.get("n", 0) or 0) < 8:
+        blockers.append(f"OOS標本不足 n={int(edge.get('n',0) or 0)}")
+        upgrade.append("OOS有効標本8件以上")
+    elif _finite_float(edge.get("avg_return"), -1) <= 0:
+        blockers.append("OOS期待値がプラス未確認")
+        upgrade.append("OOS期待値プラス")
+
+    if execution_ready:
+        action = "買い候補（買いゾーン内）"
+        reason = "実戦ゲートと価格ゲートを通過"
+    elif decision in {"買い候補", "条件付き買い"}:
+        action = "待つ"
+        reason = timing
+        if timing.startswith("押し目待ち"):
+            upgrade.insert(0, f"{entry_low:,.1f}〜{entry_high:,.1f}円まで押す")
+        elif timing == "反発確認待ち":
+            upgrade.insert(0, f"{entry_low:,.1f}円以上へ戻り反発確認")
+    elif decision == "監視":
+        action = "監視"
+        reason = " / ".join(blockers[:3]) if blockers else "買い条件の一部が未達"
+    else:
+        action = "見送り"
+        reason = " / ".join(blockers[:3]) if blockers else "実戦ゲート未通過"
+
+    if execution_ready:
+        next_condition = f"{entry_low:,.1f}〜{entry_high:,.1f}円の範囲を維持。上抜け時は追わない"
+    else:
+        # Deduplicate while preserving order.
+        uniq = []
+        for x in upgrade:
+            if x and x not in uniq:
+                uniq.append(x)
+        next_condition = " / ".join(uniq[:4]) if uniq else "条件改善を待つ"
+
     return {
         "判定": decision,
         "買いタイミング": timing,
@@ -652,6 +717,11 @@ def build_trade_plan(result: Dict) -> Dict[str, object]:
         "AI必要確率": round(dynamic_p * 100, 1),
         "OOS期待値": edge.get("avg_return", np.nan),
         "OOS件数": edge.get("n", 0),
+        "行動": action,
+        "判断理由": reason,
+        "買い昇格条件": next_condition,
+        "実行可能": execution_ready,
+        "条件成立時株数": conditional_shares,
         "推奨株数": suggested_shares,
         "想定投資額": round(position_value, 0),
         "想定最大損失": round(estimated_loss, 0),
@@ -679,7 +749,11 @@ def render_trade_plan(result: Dict, title: str = "売買プラン") -> None:
         f"**買い目安：{plan['買い下限']:,.1f}〜{plan['買い上限']:,.1f}円**  ｜  "
         f"損切り：**{plan['損切り']:,.1f}円**  ｜  利確①：**{plan['利確1']:,.1f}円**  ｜  利確②：**{plan['利確2']:,.1f}円**"
     )
-    st.markdown(f"**資金管理例**：推奨 **{int(plan['推奨株数']):,}株** ｜ 投資額 約**{plan['想定投資額']:,.0f}円** ｜ 損切り時の想定損失 約**{plan['想定最大損失']:,.0f}円**")
+    if bool(plan.get("実行可能", False)):
+        st.markdown(f"**実行サイズ**：推奨 **{int(plan['推奨株数']):,}株** ｜ 投資額 約**{plan['想定投資額']:,.0f}円** ｜ 損切り時の想定損失 約**{plan['想定最大損失']:,.0f}円**")
+    else:
+        st.markdown(f"**今は注文しない：推奨 0株** ｜ 条件成立時の参考サイズ **{int(plan.get('条件成立時株数',0)):,}株**")
+    st.caption(f"判断理由：{plan.get('判断理由','')} ｜ 次の条件：{plan.get('買い昇格条件','')}")
     oos = plan.get("OOS期待値", np.nan)
     oos_txt = f"{oos:+.1%}" if np.isfinite(_finite_float(oos, np.nan)) else "未判定"
     st.caption(f"基準日 {plan['基準日']}・終値 {plan['基準終値']:,.1f}円。市場環境 {plan['市場環境']}({plan['市場環境点']:.0f}点) / 実戦準備度 {plan['実戦準備度']}({plan['準備通過']}) / OOS期待値 {oos_txt}・n={plan['OOS件数']} / AI必要確率 {plan['AI必要確率']:.1f}% / RR ①{plan['RR1']:.2f} ②{plan['RR2']:.2f}。")
@@ -1091,24 +1165,41 @@ with market_tab:
                             "実戦準備度": plan.get("実戦準備度", ""),
                             "OOS期待値%": round(_finite_float(plan.get("OOS期待値"), np.nan) * 100, 2) if np.isfinite(_finite_float(plan.get("OOS期待値"), np.nan)) else np.nan,
                             "OOS件数": plan.get("OOS件数", 0),
+                            "行動": plan.get("行動", ""),
+                            "判断理由": plan.get("判断理由", ""),
+                            "買い昇格条件": plan.get("買い昇格条件", ""),
+                            "条件成立時株数": plan.get("条件成立時株数", 0),
                             "推奨株数": plan.get("推奨株数", 0),
                             "想定投資額": plan.get("想定投資額", 0),
                             "想定最大損失": plan.get("想定最大損失", 0),
                             "評価": res["label"],
                         })
                     except Exception as e:
-                        # A single candidate must never crash the whole market scan.
-                        # Keep the row shape stable so DataFrame construction/sorting is safe even
-                        # when every candidate failed (e.g. temporary API/plan/data issue).
+                        # V8.0.3 distinguishes a normal "history too short" exclusion from a real error.
+                        # New listings must not make the whole scan look broken.
                         err = _sanitize_api_error(e)[:180]
+                        low_err = err.lower()
+                        history_short = ("need at least" in low_err and "usable rows" in low_err) or ("履歴" in err and "不足" in err)
+                        if history_short:
+                            timing_text = "履歴不足のため評価対象外"
+                            phase_text = "履歴不足"
+                            eval_text = "評価対象外"
+                            error_text = ""
+                            exclusion_text = err
+                        else:
+                            timing_text = "分析エラーのため見送り"
+                            phase_text = "分析失敗"
+                            eval_text = "分析失敗"
+                            error_text = err
+                            exclusion_text = ""
                         final_rows.append({
                             "Code": scode,
                             "会社名": name_map.get(scode, ""),
                             "判定": "見送り",
-                            "買いタイミング": "分析エラーのため見送り",
+                            "買いタイミング": timing_text,
                             "買い候補100点": np.nan,
                             "前回比": np.nan,
-                            "相場フェーズ": "分析失敗",
+                            "相場フェーズ": phase_text,
                             f"AI {horizon}日上昇確率": np.nan,
                             "総合信頼度": np.nan,
                             "先回りレーダー": np.nan,
@@ -1128,11 +1219,16 @@ with market_tab:
                             "実戦準備度": "D",
                             "OOS期待値%": np.nan,
                             "OOS件数": 0,
+                            "行動": "対象外" if history_short else "見送り",
+                            "判断理由": "上場/取得履歴が短く検証必要本数に未達" if history_short else "分析処理でエラー",
+                            "買い昇格条件": "十分な履歴が蓄積してから再評価" if history_short else "エラー解消後に再評価",
+                            "条件成立時株数": 0,
                             "推奨株数": 0,
                             "想定投資額": 0,
                             "想定最大損失": 0,
-                            "評価": "分析失敗",
-                            "分析エラー": err,
+                            "評価": eval_text,
+                            "除外理由": exclusion_text,
+                            "分析エラー": error_text,
                         })
                 dprog.empty()
                 final_rank = pd.DataFrame(final_rows)
@@ -1151,18 +1247,27 @@ with market_tab:
                         na_position="last",
                     )
                 ok_n = int(pd.to_numeric(final_rank["買い候補100点"], errors="coerce").notna().sum()) if not final_rank.empty else 0
-                fail_n = int(len(final_rank) - ok_n)
+                excluded_n = int((final_rank.get("評価", pd.Series(index=final_rank.index, dtype=str)).astype(str) == "評価対象外").sum()) if not final_rank.empty else 0
+                fail_n = int((final_rank.get("評価", pd.Series(index=final_rank.index, dtype=str)).astype(str) == "分析失敗").sum()) if not final_rank.empty else 0
                 st.session_state["deep_market_rank"] = final_rank
-                st.session_state["deep_market_scan_counts"] = {"ok": ok_n, "failed": fail_n}
+                st.session_state["deep_market_scan_counts"] = {"ok": ok_n, "excluded": excluded_n, "failed": fail_n}
 
         if "deep_market_rank" in st.session_state:
             final_rank = st.session_state["deep_market_rank"].copy()
             counts = st.session_state.get("deep_market_scan_counts", {})
             ok_n = int(counts.get("ok", pd.to_numeric(final_rank.get("買い候補100点", pd.Series(dtype=float)), errors="coerce").notna().sum()))
-            fail_n = int(counts.get("failed", max(len(final_rank) - ok_n, 0)))
+            excluded_n = int(counts.get("excluded", (final_rank.get("評価", pd.Series(index=final_rank.index, dtype=str)).astype(str) == "評価対象外").sum()))
+            fail_n = int(counts.get("failed", (final_rank.get("評価", pd.Series(index=final_rank.index, dtype=str)).astype(str) == "分析失敗").sum()))
+            if excluded_n:
+                st.info(f"最終精査 {ok_n}銘柄成功 / {excluded_n}銘柄は履歴不足等で評価対象外。これはシステム障害ではありません。")
+                if "除外理由" in final_rank.columns:
+                    excluded_view = final_rank.loc[final_rank["除外理由"].fillna("").astype(str).ne(""), [c for c in ["Code", "会社名", "買いタイミング"] if c in final_rank.columns]].head(10)
+                    if not excluded_view.empty:
+                        with st.expander("評価対象外の銘柄を確認"):
+                            st.dataframe(excluded_view, use_container_width=True, hide_index=True)
             if fail_n:
-                if ok_n == 0:
-                    st.error("最終精査した銘柄を正常評価できませんでした。買い判断は出さず、下のエラー概要を確認してください。")
+                if ok_n == 0 and excluded_n < len(final_rank):
+                    st.error("最終精査した評価対象銘柄を正常評価できませんでした。買い判断は出さず、下のエラー概要を確認してください。")
                 else:
                     st.warning(f"最終精査 {ok_n}銘柄成功 / {fail_n}銘柄失敗。失敗銘柄は自動的に見送り扱いです。")
                 if "分析エラー" in final_rank.columns:
@@ -1181,8 +1286,21 @@ with market_tab:
             else:
                 conclusion = pd.DataFrame()
             if conclusion.empty:
-                st.info("**本日は新規買いなし**。実戦ゲートを通過した銘柄がありません。条件を緩めて無理に買わないことをV8の正式な判断とします。")
+                st.markdown("### 今日やること")
+                st.info("**新規買いは0株。今日は待つ日です。** 実戦ゲートを通過した銘柄がありません。条件を緩めて買わないことをV8.0.3の正式な判断とします。")
+                watch_score = pd.to_numeric(final_rank.get("買い候補100点", pd.Series(index=final_rank.index, dtype=float)), errors="coerce")
+                watch = final_rank[(final_rank.get("判定", "") == "監視") & watch_score.notna()].copy()
+                if not watch.empty:
+                    watch = watch.sort_values(["買い候補100点", "前回比"], ascending=[False, False], na_position="last").head(3)
+                    st.markdown("#### 次に買いへ昇格しそうな監視銘柄")
+                    for w_no, (_, w_) in enumerate(watch.iterrows(), 1):
+                        st.markdown(
+                            f"**{w_no}. {w_.get('Code','')} {w_.get('会社名','')}｜{_finite_float(w_.get('買い候補100点'),0):.1f}点**  "
+                            f"— {w_.get('判断理由','')}  \n"
+                            f"次の条件：**{w_.get('買い昇格条件','条件改善待ち')}**"
+                        )
             else:
+                st.markdown("### 今日やること")
                 for rank_no, (_, row_) in enumerate(conclusion.iterrows(), 1):
                     code_ = str(row_.get("Code", ""))
                     name_ = str(row_.get("会社名", ""))
@@ -1194,7 +1312,8 @@ with market_tab:
                     details = (
                         f"{timing_}　｜　買い目安 **{_finite_float(row_.get('買い下限')):,.1f}〜{_finite_float(row_.get('買い上限')):,.1f}円**　｜　"
                         f"損切り **{_finite_float(row_.get('損切り')):,.1f}円**　｜　利確① **{_finite_float(row_.get('利確1')):,.1f}円**　｜　利確② **{_finite_float(row_.get('利確2')):,.1f}円**\n\n"
-                        f"市場 **{row_.get('市場環境','')}** ｜ 実戦準備度 **{row_.get('実戦準備度','')}** ｜ OOS期待値 **{_finite_float(row_.get('OOS期待値%'), np.nan):+.2f}%** (n={int(_finite_float(row_.get('OOS件数'),0))}) ｜ 推奨 **{int(_finite_float(row_.get('推奨株数'),0)):,}株**"
+                        f"市場 **{row_.get('市場環境','')}** ｜ 実戦準備度 **{row_.get('実戦準備度','')}** ｜ OOS期待値 **{_finite_float(row_.get('OOS期待値%'), np.nan):+.2f}%** (n={int(_finite_float(row_.get('OOS件数'),0))}) ｜ 今日の推奨 **{int(_finite_float(row_.get('推奨株数'),0)):,}株**\n\n"
+                        f"理由：{row_.get('判断理由','')} ｜ 次の条件：{row_.get('買い昇格条件','')}"
                     )
                     if decision_ == "買い候補":
                         st.success(line1 + "\n\n" + details)
@@ -1226,12 +1345,13 @@ with market_tab:
                         "利確1": st.column_config.NumberColumn("利確1", format="%,.1f円"),
                         "利確2": st.column_config.NumberColumn("利確2", format="%,.1f円"),
                         "OOS期待値%": st.column_config.NumberColumn("OOS期待値", format="%+.2f%%"),
-                        "推奨株数": st.column_config.NumberColumn("推奨株数", format="%,d株"),
+                        "条件成立時株数": st.column_config.NumberColumn("条件成立時株数", format="%,d株"),
+                        "推奨株数": st.column_config.NumberColumn("今日の推奨株数", format="%,d株"),
                         "想定投資額": st.column_config.NumberColumn("想定投資額", format="%,.0f円"),
                         "想定最大損失": st.column_config.NumberColumn("想定最大損失", format="%,.0f円"),
                     },
                 )
-            st.download_button("最終100点ランキングCSVを保存", final_rank.drop(columns=["_priority"], errors="ignore").to_csv(index=False).encode("utf-8-sig"), file_name="japan_stock_final_100_ranking_v74.csv", mime="text/csv", key="download_deep")
+            st.download_button("最終100点ランキングCSVを保存", final_rank.drop(columns=["_priority"], errors="ignore").to_csv(index=False).encode("utf-8-sig"), file_name="japan_stock_final_100_ranking_v803.csv", mime="text/csv", key="download_deep")
             st.warning("最終売買前は、上位候補を『個別』タブで開き、重要開示・決算日も確認してください。売買プランは確定日足ベースの参考値であり、利益を保証するものではありません。")
 
 with scanner_tab:
@@ -1450,4 +1570,4 @@ with guide_tab:
     """)
 
 st.divider()
-st.caption("V8の原則：高得点でも、弱い市場・弱いOOS検証・過大なリスクなら買いません。Standard単体では確定日足を基準にし、リアルタイム気配としては扱いません。本システムは売買判断支援ツールで、利益を保証するものではありません。")
+st.caption("V8.0.3の原則：高得点でも、弱い市場・弱いOOS検証・過大なリスクなら買いません。Standard単体では確定日足を基準にし、リアルタイム気配としては扱いません。本システムは売買判断支援ツールで、利益を保証するものではありません。")
