@@ -35,7 +35,7 @@ from supply_demand import summarize_supply_demand, build_market_supply_snapshot,
 from validation import make_signal_history, event_study, validation_grade
 from optimizer import optimize_adaptive_weights, BASELINE_WEIGHTS
 from sources import (
-    JQuantsProClient,
+    JQuantsAPIClient,
     EDINETClient,
     FREDClient,
     build_macro_frame,
@@ -43,7 +43,7 @@ from sources import (
     source_confidence,
 )
 
-st.set_page_config(page_title="Stock Signal AI v7.2", page_icon="📈", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Stock Signal AI v7.3", page_icon="📈", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown(
     """
@@ -69,8 +69,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("Stock Signal AI v7.2")
-st.caption("スマホ最適化版。機能は維持したまま、ログインと日常操作を簡略化。公式・一次情報を優先し、日本株全体スキャン、100点評価、需給先回り、過去検証、適応配点を1つのURLで使えます。")
+st.title("Stock Signal AI v7.3")
+st.caption("個人向けJ-Quants API V2対応。分析機能は維持したまま、公式・一次情報を優先し、日本株全体スキャン、100点評価、需給先回り、過去検証、適応配点を1つのURLで使えます。取得できないデータを推測で埋めず、鮮度と情報充足度を明示します。")
 
 def _safe_secret(name: str, default: str = "") -> str:
     """Read hosting secret first, then environment variable. Never expose secrets in UI."""
@@ -83,73 +83,76 @@ def _safe_secret(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
-def _ensure_jquants_session() -> str:
-    if st.session_state.get("jq_token"):
-        return st.session_state["jq_token"]
-    direct = _safe_secret("JQUANTS_TOKEN", "")
-    if direct:
-        st.session_state["jq_token"] = direct
-        return direct
-    # When credentials are stored securely on the hosting side, login is automatic.
-    mail = _safe_secret("JQUANTS_MAIL", "")
-    password = _safe_secret("JQUANTS_PASSWORD", "")
-    if mail and password and not st.session_state.get("jq_auto_login_attempted"):
-        st.session_state["jq_auto_login_attempted"] = True
-        try:
-            client, refresh = JQuantsProClient.login(mail, password)
-            st.session_state["jq_token"] = client.token
-            if refresh:
-                st.session_state["jq_refresh_token"] = refresh
-            return client.token
-        except Exception as e:
-            st.session_state["jq_auto_login_error"] = str(e)
-    return ""
+def _sanitize_api_error(exc: Exception) -> str:
+    text = str(exc)
+    # Do not echo secrets if an upstream service ever includes request headers in an error.
+    key = _safe_secret("JQUANTS_API_KEY", "")
+    return text.replace(key, "***") if key else text
 
 
-jq_token = _ensure_jquants_session()
+@st.cache_data(ttl=900, show_spinner=False)
+def check_jquants_connection(api_key: str) -> dict:
+    if not api_key:
+        return {"ok": False, "latest": None, "age_days": None, "error": "APIキー未設定"}
+    try:
+        latest = JQuantsAPIClient(api_key).latest_data_date()
+        if latest is None:
+            return {"ok": False, "latest": None, "age_days": None, "error": "株価データを確認できませんでした"}
+        age_days = max(0, (pd.Timestamp(date.today()) - pd.Timestamp(latest)).days)
+        return {"ok": True, "latest": pd.Timestamp(latest), "age_days": age_days, "error": ""}
+    except Exception as e:
+        return {"ok": False, "latest": None, "age_days": None, "error": _sanitize_api_error(e)}
+
+
+jq_api_key = _safe_secret("JQUANTS_API_KEY", "")
 edinet_key = _safe_secret("EDINET_API_KEY", "")
 fred_key = _safe_secret("FRED_API_KEY", "")
+jq_status = check_jquants_connection(jq_api_key) if jq_api_key else {"ok": False, "latest": None, "age_days": None, "error": "APIキー未設定"}
+jq_connected = bool(jq_status.get("ok"))
+jq_latest_date = jq_status.get("latest")
+jq_data_age_days = jq_status.get("age_days")
+# The Free plan is 12 weeks delayed. A generous 14-day threshold avoids mistaking weekends/holidays
+# for delayed data while preventing stale data from being labelled as "today".
+jq_live_eligible = bool(jq_connected and jq_data_age_days is not None and jq_data_age_days <= 14)
 
-status_col, action_col = st.columns([1.4, 1])
+status_col, action_col = st.columns([1.55, 1])
 with status_col:
-    if jq_token:
-        st.success("✅ 公式データ接続済み — そのまま使えます")
+    if jq_live_eligible:
+        st.success(f"✅ J-Quants API V2 接続済み ｜ 最新データ {jq_latest_date.date()}")
+    elif jq_connected:
+        st.warning(f"🕒 J-Quants接続済みですが最新データは {jq_latest_date.date()}（{jq_data_age_days}日前）。遅延データとして検証には使えますが、『今日の買い候補』には使いません。")
+    elif jq_api_key:
+        st.error(f"J-Quants APIへ接続できません: {jq_status.get('error','不明なエラー')}")
     else:
-        st.warning("🔐 初回だけJ-Quantsへログインしてください")
+        st.warning("🔑 初回だけ J-Quants APIキーを設定してください")
 with action_col:
-    if jq_token and st.button("接続をやり直す", use_container_width=True):
-        for k in ["jq_token", "jq_refresh_token", "jq_auto_login_attempted", "jq_auto_login_error"]:
-            st.session_state.pop(k, None)
+    if jq_api_key and st.button("接続状態を再確認", use_container_width=True):
+        check_jquants_connection.clear()
         st.rerun()
 
-if not jq_token:
-    with st.expander("🔐 初回ログイン（普段は開きません）", expanded=True):
-        st.caption("J-Quants Proの公式アカウントでログインします。入力したパスワードをこのアプリのファイルへ保存しません。公開担当者がSecrets設定を済ませれば、この画面自体を省略できます。")
-        with st.form("jquants_login_form"):
-            jq_mail_ui = st.text_input("J-Quantsのメールアドレス", autocomplete="email")
-            jq_pw_ui = st.text_input("J-Quantsのパスワード", type="password")
-            login_submit = st.form_submit_button("公式データに接続", type="primary", use_container_width=True)
-        if login_submit:
-            try:
-                with st.spinner("J-Quants公式APIへ接続中…"):
-                    client, refresh = JQuantsProClient.login(jq_mail_ui.strip(), jq_pw_ui)
-                st.session_state["jq_token"] = client.token
-                if refresh:
-                    st.session_state["jq_refresh_token"] = refresh
-                st.session_state.pop("jq_auto_login_error", None)
-                st.rerun()
-            except Exception as e:
-                st.error(f"接続できませんでした: {e}")
+if not jq_api_key:
+    with st.expander("🔑 初回設定（APIキーを1回だけ登録）", expanded=True):
+        st.markdown("""
+J-Quants **個人向けAPI V2**を使います。J-Quants Proの契約は不要です。  
+APIキーはJ-Quants公式ダッシュボードで発行し、Streamlitの **Settings → Secrets** に次の1行だけ保存します。
+
+`JQUANTS_API_KEY = "あなたのAPIキー"`
+
+APIキーはこのチャットやGitHubへ貼らないでください。保存後はこの入力画面を普段開く必要はありません。
+""")
+elif jq_connected and not jq_live_eligible:
+    st.info("現在のデータ鮮度では、個別の過去分析・AI検証は利用できます。『今日』と『100点ランキング』は誤判断防止のためライブ売買候補としては停止します。")
 
 with st.expander("👋 使い方（30秒）", expanded=False):
     st.markdown("""
 **普段はこの3操作だけです。**
 
-1. **🌐 全市場**を開く
+1. **🌐 今日**を開く
 2. **今日の買い候補を更新**を押す
 3. 上位候補を見て、気になる銘柄は **🔎 個別** で100点評価・需給・過去検証を確認
 
-公開担当者がJ-Quants/EDINET/FREDの認証をSecretsへ設定すると、スマホ側ではログイン入力も不要にできます。SNS・匿名掲示板・まとめサイトは標準スコアには使いません。
+公式・一次情報を優先します。SNS・匿名掲示板・まとめサイトは標準スコアには使いません。  
+契約プランで取得できない公式データは**推測で補完せず「未取得」扱い**にし、情報充足度・信頼度を下げます。
 """)
 
 with st.sidebar:
@@ -191,23 +194,23 @@ def parse_official_csv(uploaded) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def load_jq_quotes(token: str, code_: str, start: str, end: str) -> pd.DataFrame:
-    return JQuantsProClient(token).daily_quotes(code_, start, end)
+def load_jq_quotes(api_key: str, code_: str, start: str, end: str) -> pd.DataFrame:
+    return JQuantsAPIClient(api_key).daily_quotes(code_, start, end)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_jq_fundamentals(token: str, code_: str) -> pd.DataFrame:
-    return JQuantsProClient(token).statements(code_)
+def load_jq_fundamentals(api_key: str, code_: str) -> pd.DataFrame:
+    return JQuantsAPIClient(api_key).statements(code_)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_jq_supply_bundle(token: str, code_: str, end_date: str):
-    client = JQuantsProClient(token)
+def load_jq_supply_bundle(api_key: str, code_: str, end_date: str):
+    client = JQuantsAPIClient(api_key)
     end_ts = pd.Timestamp(end_date)
     start90 = (end_ts - pd.Timedelta(days=120)).date().isoformat()
     start180 = (end_ts - pd.Timedelta(days=220)).date().isoformat()
     start365 = (end_ts - pd.Timedelta(days=420)).date().isoformat()
-    bundle = {}
+    bundle = {"_errors": {}}
     getters = {
         "breakdown": lambda: client.breakdown(code_, start90, end_date),
         "daily_margin": lambda: client.daily_margin_interest(code_, start180, end_date),
@@ -220,8 +223,10 @@ def load_jq_supply_bundle(token: str, code_: str, end_date: str):
     for key, fn in getters.items():
         try:
             bundle[key] = fn()
-        except Exception:
+        except Exception as e:
             bundle[key] = pd.DataFrame()
+            # Keep a sanitized reason so the UI can distinguish "no event" from "plan not available".
+            bundle["_errors"][key] = _sanitize_api_error(e)[:160]
     return bundle
 
 
@@ -244,18 +249,26 @@ def supply_statuses(bundle: dict) -> list[SourceStatus]:
     # an explicit coverage ratio.
     rows = sum(len(d) for d in bundle.values() if isinstance(d, pd.DataFrame))
     any_data = any(isinstance(d, pd.DataFrame) and not d.empty for d in bundle.values())
-    msg = f"公式需給データ {rows}件" if any_data else "該当データなし（中立扱い）"
-    return [SourceStatus("JPX/J-Quants", 1, True, msg, None, rows)]
+    errors = bundle.get("_errors", {}) if isinstance(bundle, dict) else {}
+    if any_data and errors:
+        msg = f"公式需給データ {rows}件 / プラン等で未取得 {len(errors)}項目"
+    elif any_data:
+        msg = f"公式需給データ {rows}件"
+    elif errors:
+        msg = f"需給データ未取得（プラン/権限 {len(errors)}項目・中立扱い）"
+    else:
+        msg = "該当データなし（中立扱い）"
+    return [SourceStatus("JPX/J-Quants", 1, bool(any_data or not errors), msg, None, rows)]
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
-def load_jq_listed(token: str, target_date: str | None = None) -> pd.DataFrame:
-    return JQuantsProClient(token).listed_info(target_date)
+def load_jq_listed(api_key: str, target_date: str | None = None) -> pd.DataFrame:
+    return JQuantsAPIClient(api_key).listed_info(target_date)
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
-def load_jq_market_date(token: str, target_date: str) -> pd.DataFrame:
-    return JQuantsProClient(token).daily_quotes_for_date(target_date)
+def load_jq_market_date(api_key: str, target_date: str) -> pd.DataFrame:
+    return JQuantsAPIClient(api_key).daily_quotes_for_date(target_date)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -445,12 +458,12 @@ with main_tab:
             statuses: list[SourceStatus] = []
 
             if mode == "J-Quants公式API":
-                if not jq_token:
-                    st.error("J-Quants Proへの接続が必要です。画面上部の「初回ログイン」から接続してください。非公式価格サイトには自動切替しません。")
+                if not jq_connected:
+                    st.error("J-Quants APIへ正常接続できていません。画面上部の接続状態を確認してください。非公式価格サイトには自動切替しません。")
                     st.stop()
-                px = load_jq_quotes(jq_token, code, start.isoformat(), end.isoformat())
-                bm = load_jq_quotes(jq_token, benchmark_code, start.isoformat(), end.isoformat())
-                fundamentals = load_jq_fundamentals(jq_token, code)
+                px = load_jq_quotes(jq_api_key, code, start.isoformat(), end.isoformat())
+                bm = load_jq_quotes(jq_api_key, benchmark_code, start.isoformat(), end.isoformat())
+                fundamentals = load_jq_fundamentals(jq_api_key, code)
                 statuses += [
                     SourceStatus("JPX/J-Quants", 1, not px.empty, "対象株価", px.index.max() if not px.empty else None, len(px)),
                     SourceStatus("JPX/J-Quants", 1, not bm.empty, "市場ベンチマーク", bm.index.max() if not bm.empty else None, len(bm)),
@@ -490,7 +503,7 @@ with main_tab:
             supply_summary = {}
             supply_bundle = {}
             if mode == "J-Quants公式API":
-                supply_bundle = load_jq_supply_bundle(jq_token, code, end.isoformat())
+                supply_bundle = load_jq_supply_bundle(jq_api_key, code, end.isoformat())
                 supply_summary = supply_summary_from_bundle(supply_bundle)
                 statuses += supply_statuses(supply_bundle)
 
@@ -618,18 +631,21 @@ with market_tab:
     mc1, mc2, mc3, mc4 = st.columns(4)
     radar_days = mc1.selectbox("全市場履歴", [330, 390, 450], index=1, format_func=lambda x: f"約{x}暦日")
     deep_n = mc2.selectbox("最終精査する上位数", [10, 20, 30, 50], index=1)
-    min_turn_m = mc3.number_input("最低売買代金/日", min_value=0, max_value=5000, value=50, step=50, help="百万円。流動性が極端に低い銘柄を除外します。")
+    min_turn_m = mc3.number_input("最低売買代金/日（百万円）", min_value=0, max_value=5000, value=50, step=50, help="百万円。流動性が極端に低い銘柄を除外します。")
     preferred = mc4.multiselect("優先レーダー", ["需給先回り候補", "初動レーダー", "押し目レーダー", "上昇継続レーダー", "過熱警戒", "需給悪化警戒", "監視"], default=["需給先回り候補", "初動レーダー", "押し目レーダー", "上昇継続レーダー"])
 
-    st.info("初回だけ過去の全市場日次データを公式APIから収集します。取得済み日付はPC内にキャッシュするため、2回目以降は差分中心になります。")
+    st.info("初回だけ過去の全市場日次データを公式APIから収集します。取得済み日付はサーバー側にキャッシュするため、2回目以降は差分中心になります。")
+    st.caption("データ範囲はJ-Quants契約プランに連動します。Light以上で現在株価、Standard以上で信用・空売り、Premiumで売買内訳が追加されます。取得できない項目は推測せず、需給充足度を下げて評価します。")
 
     if st.button("今日の買い候補を更新", type="primary", use_container_width=True, key="all_market_scan"):
-        if not jq_token:
-            st.error("J-Quants Proへの接続が必要です。画面上部の「初回ログイン」から接続してください。")
+        if not jq_connected:
+            st.error("J-Quants APIへ正常接続できていません。画面上部の接続状態を確認してください。")
+        elif not jq_live_eligible:
+            st.error("現在のJ-Quantsデータは遅延しています。遅延データを『今日の買い候補』として表示すると危険なので停止しました。ライブ候補にはLight以上が必要です。")
         else:
             progress = st.progress(0, text="全市場データを準備中")
             try:
-                listed = load_jq_listed(jq_token, None)
+                listed = load_jq_listed(jq_api_key, None)
                 universe = filter_common_equities(listed)
                 universe_codes = set(universe["Code"].astype(str)) if not universe.empty else set()
                 scan_cfg = ScanConfig(
@@ -643,21 +659,23 @@ with market_tab:
                     progress.progress(float(frac), text=txt)
 
                 panel, stats = collect_market_panel(
-                    lambda dt: load_jq_market_date(jq_token, dt),
+                    lambda dt: load_jq_market_date(jq_api_key, dt),
                     date.today(),
                     scan_cfg,
                     progress_cb=_pcb,
                 )
                 if panel.empty:
-                    raise ValueError("全市場の日次株価を取得できませんでした。ID token、契約データセット、通信状態を確認してください。")
-                if universe_codes:
-                    panel = panel[panel["Code"].astype(str).isin(universe_codes)]
+                    raise ValueError("全市場の日次株価を取得できませんでした。APIキー、契約プラン、データ提供期間、通信状態を確認してください。")
+                # Calculate relative strength while the benchmark ETF is still in the panel,
+                # then restrict the resulting universe to common equities.
                 radar = fast_market_features(panel, benchmark_code=benchmark_code)
+                if universe_codes and not radar.empty:
+                    radar = radar[radar["Code"].astype(str).isin(universe_codes)].copy()
                 radar = enrich_with_listed(radar, universe)
                 radar = radar[radar["rows"] >= scan_cfg.min_price_rows]
                 radar = radar[radar["TurnoverValue"].fillna(0) >= scan_cfg.min_turnover_yen]
                 progress.progress(0.05, text="公式需給データを横断集計中")
-                client = JQuantsProClient(jq_token)
+                client = JQuantsAPIClient(jq_api_key)
                 supply_frames = collect_recent_supply_market(client, date.today(), cache_dir=".supply_cache", progress_cb=_pcb)
                 supply_snap = build_market_supply_snapshot(
                     supply_frames.get("breakdown", pd.DataFrame()),
@@ -734,7 +752,7 @@ with market_tab:
                 start = end - timedelta(days=int(years * 365.25 + 300))
                 dprog = st.progress(0, text="最終100点評価を開始")
                 try:
-                    bm = load_jq_quotes(jq_token, benchmark_code, start.isoformat(), end.isoformat())
+                    bm = load_jq_quotes(jq_api_key, benchmark_code, start.isoformat(), end.isoformat())
                 except Exception:
                     bm = pd.DataFrame()
                 macro = pd.DataFrame()
@@ -750,14 +768,14 @@ with market_tab:
                 for i, scode in enumerate(candidates):
                     dprog.progress((i + 1) / max(len(candidates), 1), text=f"{scode} を最終精査中")
                     try:
-                        px = load_jq_quotes(jq_token, scode, start.isoformat(), end.isoformat())
-                        fundamentals = load_jq_fundamentals(jq_token, scode)
+                        px = load_jq_quotes(jq_api_key, scode, start.isoformat(), end.isoformat())
+                        fundamentals = load_jq_fundamentals(jq_api_key, scode)
                         statuses = [
                             SourceStatus("JPX/J-Quants", 1, not px.empty, "対象株価", px.index.max() if not px.empty else None, len(px)),
                             SourceStatus("JPX/J-Quants", 1, not bm.empty, "市場ベンチマーク", bm.index.max() if not bm.empty else None, len(bm)),
                             SourceStatus("JPX/J-Quants", 1, not fundamentals.empty, "四半期財務", fundamentals.index.max() if not fundamentals.empty else None, len(fundamentals)),
                         ] + macro_status
-                        supply_bundle = load_jq_supply_bundle(jq_token, scode, end.isoformat())
+                        supply_bundle = load_jq_supply_bundle(jq_api_key, scode, end.isoformat())
                         ss = supply_summary_from_bundle(supply_bundle)
                         statuses += supply_statuses(supply_bundle)
                         # Batch deep scan skips the separate EDINET document crawl for speed, but J-Quants official buyback/market data are included.
@@ -812,8 +830,10 @@ with scanner_tab:
     phase_filter = st.multiselect("優先表示フェーズ", ["初動候補", "押し目候補", "上昇継続", "底打ち候補", "中立・監視", "過熱警戒", "売り警戒", "下落基調"])
 
     if st.button("ランキングを作成", type="primary", use_container_width=True):
-        if not jq_token:
-            st.error("ランキング作成にはJ-Quants Proへの接続が必要です。")
+        if not jq_connected:
+            st.error("ランキング作成にはJ-Quants APIへの正常接続が必要です。")
+        elif not jq_live_eligible:
+            st.error("現在のデータは遅延しています。現在の売買候補ランキングとしては表示しません。個別タブの過去分析・検証は利用できます。")
         else:
             codes = [x.strip() for x in code_text.replace(",", "\n").splitlines() if x.strip()]
             if code_file is not None:
@@ -826,7 +846,7 @@ with scanner_tab:
             rows = []
             progress = st.progress(0, text="スキャン開始")
             try:
-                bm = load_jq_quotes(jq_token, benchmark_code, start.isoformat(), end.isoformat())
+                bm = load_jq_quotes(jq_api_key, benchmark_code, start.isoformat(), end.isoformat())
             except Exception:
                 bm = pd.DataFrame()
             macro = pd.DataFrame()
@@ -840,15 +860,15 @@ with scanner_tab:
             for i, scode in enumerate(codes):
                 progress.progress((i + 1) / max(len(codes), 1), text=f"{scode} を分析中")
                 try:
-                    px = load_jq_quotes(jq_token, scode, start.isoformat(), end.isoformat())
-                    fundamentals = load_jq_fundamentals(jq_token, scode)
+                    px = load_jq_quotes(jq_api_key, scode, start.isoformat(), end.isoformat())
+                    fundamentals = load_jq_fundamentals(jq_api_key, scode)
                     statuses = [
                         SourceStatus("JPX/J-Quants", 1, not px.empty, "対象株価", px.index.max() if not px.empty else None, len(px)),
                         SourceStatus("JPX/J-Quants", 1, not bm.empty, "市場ベンチマーク", bm.index.max() if not bm.empty else None, len(bm)),
                         SourceStatus("JPX/J-Quants", 1, not fundamentals.empty, "四半期財務", fundamentals.index.max() if not fundamentals.empty else None, len(fundamentals)),
                     ] + macro_status
                     edocs = pd.DataFrame()  # Batch mode avoids slow per-name EDINET document crawl.
-                    supply_bundle = load_jq_supply_bundle(jq_token, scode, end.isoformat())
+                    supply_bundle = load_jq_supply_bundle(jq_api_key, scode, end.isoformat())
                     ss = supply_summary_from_bundle(supply_bundle)
                     statuses += supply_statuses(supply_bundle)
                     res = analyze_one(scode, px, bm, fundamentals, macro, statuses, edocs, ss)
