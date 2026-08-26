@@ -26,7 +26,7 @@ from core import (
     classify_market_phase,
     buy_score_label,
 )
-from models import walk_forward_ensemble, fit_final_probability, model_confidence
+from models import walk_forward_ensemble, model_confidence
 from market_scanner import (
     ScanConfig, collect_market_panel, fast_market_features, filter_common_equities,
     enrich_with_listed, collect_recent_supply_market,
@@ -43,7 +43,7 @@ from sources import (
     source_confidence,
 )
 
-st.set_page_config(page_title="Stock Signal AI v8.0.3", page_icon="📈", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Stock Signal AI v8.0.4", page_icon="📈", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown(
     """
@@ -69,7 +69,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("Stock Signal AI v8.0.3")
+st.title("Stock Signal AI v8.0.4")
 st.caption("個人向けJ-Quants API V2対応。V8は『当てる』だけでなく、**市場環境・アウトオブサンプル優位性・資金管理・現実的な約定検証**を通過した銘柄だけを実戦候補にします。取得できないデータは推測で埋めません。")
 
 def _safe_secret(name: str, default: str = "") -> str:
@@ -278,6 +278,61 @@ def load_jq_market_date(api_key: str, target_date: str) -> pd.DataFrame:
     return JQuantsAPIClient(api_key).daily_quotes_for_date(target_date)
 
 
+@st.cache_data(ttl=21600, show_spinner=False, max_entries=16)
+def build_market_snapshot_cached(
+    api_key: str,
+    end_date_iso: str,
+    latest_tag: str,
+    radar_days: int,
+    min_turn_m: float,
+    benchmark_code_: str,
+):
+    """Build the expensive all-market discovery snapshot once per data/settings key.
+
+    latest_tag is intentionally part of the cache key so a newly published J-Quants
+    trading day invalidates the previous result even when the calendar date is unchanged.
+    """
+    _ = latest_tag
+    end_dt = pd.Timestamp(end_date_iso).date()
+    listed = load_jq_listed(api_key, None)
+    universe = filter_common_equities(listed)
+    universe_codes = set(universe["Code"].astype(str)) if not universe.empty else set()
+    scan_cfg = ScanConfig(
+        lookback_calendar_days=int(radar_days),
+        min_price_rows=205,
+        min_turnover_yen=float(min_turn_m) * 1_000_000,
+        cache_dir=".scanner_cache",
+    )
+    panel, stats = collect_market_panel(
+        lambda dt: load_jq_market_date(api_key, dt),
+        end_dt,
+        scan_cfg,
+        progress_cb=None,
+    )
+    if panel.empty:
+        return pd.DataFrame(), universe, pd.DataFrame(), stats
+
+    radar = fast_market_features(panel, benchmark_code=benchmark_code_)
+    if universe_codes and not radar.empty:
+        radar = radar[radar["Code"].astype(str).isin(universe_codes)].copy()
+    radar = enrich_with_listed(radar, universe)
+    if not radar.empty:
+        radar = radar[radar["rows"] >= scan_cfg.min_price_rows]
+        radar = radar[radar["TurnoverValue"].fillna(0) >= scan_cfg.min_turnover_yen]
+
+    client = JQuantsAPIClient(api_key)
+    supply_frames = collect_recent_supply_market(client, end_dt, cache_dir=".supply_cache", progress_cb=None)
+    supply_snap = build_market_supply_snapshot(
+        supply_frames.get("breakdown", pd.DataFrame()),
+        supply_frames.get("daily_margin", pd.DataFrame()),
+        supply_frames.get("weekly_margin", pd.DataFrame()),
+        supply_frames.get("shorts", pd.DataFrame()),
+        supply_frames.get("buyback_tdnet", pd.DataFrame()),
+    )
+    radar = merge_supply_snapshot(radar, supply_snap)
+    return radar, universe, supply_snap, stats
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_macro(key: str, start: str, end: str):
     return build_macro_frame(FREDClient(key), start, end)
@@ -327,8 +382,11 @@ def analyze_one(
         min_train_rows=cfg.min_train_rows,
         test_rows=cfg.test_rows,
         embargo_rows=cfg.horizon_days,
+        X_live=X_live,
     )
-    live_p = fit_final_probability(X_train, y, X_live)
+    # V8.0.4: the final fitted ensemble is reused for the live prediction.
+    # This avoids fitting the same three models twice for every candidate.
+    live_p = wf.latest_probability
     src_conf = source_confidence(statuses)
     conf = model_confidence(wf.metrics, src_conf, data_coverage)
 
@@ -396,6 +454,46 @@ def analyze_one(
         "px": px,
         "bm": bm,
     }
+
+
+@st.cache_data(ttl=21600, show_spinner=False, max_entries=128)
+def analyze_market_candidate_cached(
+    api_key: str,
+    code_: str,
+    start_iso: str,
+    end_iso: str,
+    benchmark_code_: str,
+    fred_key_: str,
+    horizon_days: int,
+    tx_cost_bps: int,
+    cache_version: str,
+):
+    """Cache the expensive final ML/OOS analysis for a confirmed daily bar.
+
+    horizon_days, tx_cost_bps and cache_version are included in the cache key. The
+    current global cfg has the same values at call time and is used by analyze_one.
+    """
+    _ = (horizon_days, tx_cost_bps, cache_version)
+    px = load_jq_quotes(api_key, code_, start_iso, end_iso)
+    bm = load_jq_quotes(api_key, benchmark_code_, start_iso, end_iso)
+    fundamentals = load_jq_fundamentals(api_key, code_)
+    macro = pd.DataFrame()
+    macro_status = []
+    if fred_key_:
+        try:
+            macro, macro_status = load_macro(fred_key_, start_iso, end_iso)
+        except Exception:
+            macro, macro_status = pd.DataFrame(), []
+    statuses = [
+        SourceStatus("JPX/J-Quants", 1, not px.empty, "対象株価", px.index.max() if not px.empty else None, len(px)),
+        SourceStatus("JPX/J-Quants", 1, not bm.empty, "市場ベンチマーク", bm.index.max() if not bm.empty else None, len(bm)),
+        SourceStatus("JPX/J-Quants", 1, not fundamentals.empty, "四半期財務", fundamentals.index.max() if not fundamentals.empty else None, len(fundamentals)),
+    ] + macro_status
+    supply_bundle = load_jq_supply_bundle(api_key, code_, end_iso)
+    ss = supply_summary_from_bundle(supply_bundle)
+    statuses += supply_statuses(supply_bundle)
+    res = analyze_one(code_, px, bm, fundamentals, macro, statuses, pd.DataFrame(), ss)
+    return res, ss
 
 
 def score_gauge(score: float):
@@ -631,7 +729,7 @@ def build_trade_plan(result: Dict) -> Dict[str, object]:
     shares_alloc = int((float(account_capital) * float(max_position_pct) / 100.0) // (entry_mid * 100)) * 100
     conditional_shares = max(0, min(shares_risk, shares_alloc))
 
-    # V8.0.3: a position size is an ACTION only when both the practical gate and the
+    # V8.0.4: a position size is an ACTION only when both the practical gate and the
     # price gate are satisfied.  Watch/skip names must never look like an order suggestion.
     execution_ready = bool(decision in {"買い候補", "条件付き買い"} and timing == "買いゾーン内")
     suggested_shares = conditional_shares if execution_ready else 0
@@ -981,11 +1079,15 @@ with market_tab:
 
     mc1, mc2, mc3, mc4 = st.columns(4)
     radar_days = mc1.selectbox("全市場履歴", [330, 390, 450], index=1, format_func=lambda x: f"約{x}暦日")
-    deep_n = mc2.selectbox("最終精査する上位数", [10, 20, 30, 50], index=1)
+    deep_n = mc2.selectbox(
+        "最終精査する上位数", [8, 10, 15, 20], index=1,
+        help="V8.0.4は通常10銘柄を推奨。自動更新は最大10銘柄まで精査し、必要な時だけ手動で15〜20銘柄を追加確認します。",
+    )
     min_turn_m = mc3.number_input("最低売買代金/日（百万円）", min_value=0, max_value=5000, value=50, step=50, help="百万円。流動性が極端に低い銘柄を除外します。")
     preferred = mc4.multiselect("優先レーダー", ["需給先回り候補", "初動レーダー", "押し目レーダー", "上昇継続レーダー", "過熱警戒", "需給悪化警戒", "監視"], default=["需給先回り候補", "初動レーダー", "押し目レーダー", "上昇継続レーダー"])
 
-    st.info("初回だけ過去の全市場日次データを公式APIから収集します。取得済み日付はサーバー側にキャッシュするため、2回目以降は差分中心になります。")
+    st.info("初回だけ過去の全市場日次データを公式APIから収集します。V8.0.4は全市場集計と最終AI評価を6時間キャッシュし、同じ日の再計算を極力避けます。")
+    st.caption("⚙️ CPUセーフ設計：通常のワンクリック更新は上位10銘柄まで最終精査します。11位以下も確認したい場合だけ『上位○銘柄を再精査』を手動で実行してください。")
     st.caption("データ範囲はJ-Quants契約プランに連動します。Light以上で現在株価、Standard以上で信用・空売り、Premiumで売買内訳が追加されます。取得できない項目は推測せず、需給充足度を下げて評価します。")
 
     if st.button("本日の結論を更新（全市場→100点→実戦ゲート→売買プラン）", type="primary", use_container_width=True, key="all_market_scan"):
@@ -997,46 +1099,19 @@ with market_tab:
         else:
             progress = st.progress(0, text="全市場データを準備中")
             try:
-                listed = load_jq_listed(jq_api_key, None)
-                universe = filter_common_equities(listed)
-                universe_codes = set(universe["Code"].astype(str)) if not universe.empty else set()
-                scan_cfg = ScanConfig(
-                    lookback_calendar_days=int(radar_days),
-                    min_price_rows=205,
-                    min_turnover_yen=float(min_turn_m) * 1_000_000,
-                    cache_dir=".scanner_cache",
+                progress.progress(0.10, text="全市場の当日キャッシュを確認中")
+                latest_tag = jq_latest_date.date().isoformat() if jq_latest_date is not None else date.today().isoformat()
+                radar, universe, supply_snap, stats = build_market_snapshot_cached(
+                    jq_api_key,
+                    date.today().isoformat(),
+                    latest_tag,
+                    int(radar_days),
+                    float(min_turn_m),
+                    str(benchmark_code),
                 )
-
-                def _pcb(frac, txt):
-                    progress.progress(float(frac), text=txt)
-
-                panel, stats = collect_market_panel(
-                    lambda dt: load_jq_market_date(jq_api_key, dt),
-                    date.today(),
-                    scan_cfg,
-                    progress_cb=_pcb,
-                )
-                if panel.empty:
+                if radar is None or radar.empty:
                     raise ValueError("全市場の日次株価を取得できませんでした。APIキー、契約プラン、データ提供期間、通信状態を確認してください。")
-                # Calculate relative strength while the benchmark ETF is still in the panel,
-                # then restrict the resulting universe to common equities.
-                radar = fast_market_features(panel, benchmark_code=benchmark_code)
-                if universe_codes and not radar.empty:
-                    radar = radar[radar["Code"].astype(str).isin(universe_codes)].copy()
-                radar = enrich_with_listed(radar, universe)
-                radar = radar[radar["rows"] >= scan_cfg.min_price_rows]
-                radar = radar[radar["TurnoverValue"].fillna(0) >= scan_cfg.min_turnover_yen]
-                progress.progress(0.05, text="公式需給データを横断集計中")
-                client = JQuantsAPIClient(jq_api_key)
-                supply_frames = collect_recent_supply_market(client, date.today(), cache_dir=".supply_cache", progress_cb=_pcb)
-                supply_snap = build_market_supply_snapshot(
-                    supply_frames.get("breakdown", pd.DataFrame()),
-                    supply_frames.get("daily_margin", pd.DataFrame()),
-                    supply_frames.get("weekly_margin", pd.DataFrame()),
-                    supply_frames.get("shorts", pd.DataFrame()),
-                    supply_frames.get("buyback_tdnet", pd.DataFrame()),
-                )
-                radar = merge_supply_snapshot(radar, supply_snap)
+                progress.progress(1.0, text="全市場レーダー準備完了")
                 st.session_state["market_supply_snapshot"] = supply_snap
                 st.session_state["market_radar"] = radar
                 st.session_state["market_listed"] = universe
@@ -1096,46 +1171,30 @@ with market_tab:
         rr4.metric("先回り80点以上", int((radar["early_radar_score"] >= 80).sum()))
 
         st.markdown("### 上位候補を最終100点評価")
-        st.caption("ここからは価格だけでなく、財務・AIのWalk-forward検証・情報信頼度を含めて再評価します。最終100点ランキングはこちらの結果を採用してください。")
+        st.caption("ここからは価格だけでなく、財務・AIのWalk-forward検証・情報信頼度を含めて再評価します。V8.0.4は同じ銘柄・同じ基準日のAI結果を再利用し、無駄な再学習を避けます。")
         manual_deep = st.button(f"上位 {deep_n} 銘柄を再精査", type="secondary", use_container_width=True, key="deep_scan_top")
         auto_deep = bool(st.session_state.pop("auto_deep_scan_requested", False))
         if manual_deep or auto_deep:
-            candidates = visible.head(int(deep_n))["Code"].astype(str).tolist()
+            # One-click daily operation is deliberately capped at 10 expensive ML analyses.
+            # Manual re-scan honors the selected number when the user explicitly wants broader coverage.
+            effective_deep_n = int(deep_n) if manual_deep else min(int(deep_n), 10)
+            candidates = visible.head(effective_deep_n)["Code"].astype(str).tolist()
             if not candidates:
                 st.warning("優先レーダー条件に該当する候補がありません。フィルターを広げてください。")
             else:
                 end = date.today()
                 start = end - timedelta(days=int(years * 365.25 + 300))
-                dprog = st.progress(0, text="最終100点評価を開始")
-                try:
-                    bm = load_jq_quotes(jq_api_key, benchmark_code, start.isoformat(), end.isoformat())
-                except Exception:
-                    bm = pd.DataFrame()
-                macro = pd.DataFrame()
-                macro_status = []
-                if fred_key:
-                    try:
-                        macro, macro_status = load_macro(fred_key, start.isoformat(), end.isoformat())
-                    except Exception:
-                        pass
+                dprog = st.progress(0, text="最終100点評価を開始（同日結果は再利用）")
                 final_rows = []
                 listed_meta = st.session_state.get("market_listed", pd.DataFrame())
                 name_map = dict(zip(listed_meta.get("Code", pd.Series(dtype=str)).astype(str), listed_meta.get("CompanyName", pd.Series(dtype=str)))) if not listed_meta.empty else {}
                 for i, scode in enumerate(candidates):
                     dprog.progress((i + 1) / max(len(candidates), 1), text=f"{scode} を最終精査中")
                     try:
-                        px = load_jq_quotes(jq_api_key, scode, start.isoformat(), end.isoformat())
-                        fundamentals = load_jq_fundamentals(jq_api_key, scode)
-                        statuses = [
-                            SourceStatus("JPX/J-Quants", 1, not px.empty, "対象株価", px.index.max() if not px.empty else None, len(px)),
-                            SourceStatus("JPX/J-Quants", 1, not bm.empty, "市場ベンチマーク", bm.index.max() if not bm.empty else None, len(bm)),
-                            SourceStatus("JPX/J-Quants", 1, not fundamentals.empty, "四半期財務", fundamentals.index.max() if not fundamentals.empty else None, len(fundamentals)),
-                        ] + macro_status
-                        supply_bundle = load_jq_supply_bundle(jq_api_key, scode, end.isoformat())
-                        ss = supply_summary_from_bundle(supply_bundle)
-                        statuses += supply_statuses(supply_bundle)
-                        # Batch deep scan skips the separate EDINET document crawl for speed, but J-Quants official buyback/market data are included.
-                        res = analyze_one(scode, px, bm, fundamentals, macro, statuses, pd.DataFrame(), ss)
+                        res, ss = analyze_market_candidate_cached(
+                            jq_api_key, scode, start.isoformat(), end.isoformat(), str(benchmark_code),
+                            fred_key, int(horizon), int(tx_cost), "v804",
+                        )
                         rr = radar[radar["Code"].astype(str) == scode].head(1)
                         plan = build_trade_plan(res)
                         final_rows.append({
@@ -1175,7 +1234,7 @@ with market_tab:
                             "評価": res["label"],
                         })
                     except Exception as e:
-                        # V8.0.3 distinguishes a normal "history too short" exclusion from a real error.
+                        # V8.0.4 distinguishes a normal "history too short" exclusion from a real error.
                         # New listings must not make the whole scan look broken.
                         err = _sanitize_api_error(e)[:180]
                         low_err = err.lower()
@@ -1287,7 +1346,7 @@ with market_tab:
                 conclusion = pd.DataFrame()
             if conclusion.empty:
                 st.markdown("### 今日やること")
-                st.info("**新規買いは0株。今日は待つ日です。** 実戦ゲートを通過した銘柄がありません。条件を緩めて買わないことをV8.0.3の正式な判断とします。")
+                st.info("**新規買いは0株。今日は待つ日です。** 実戦ゲートを通過した銘柄がありません。条件を緩めて買わないことをV8.0.4の正式な判断とします。")
                 watch_score = pd.to_numeric(final_rank.get("買い候補100点", pd.Series(index=final_rank.index, dtype=float)), errors="coerce")
                 watch = final_rank[(final_rank.get("判定", "") == "監視") & watch_score.notna()].copy()
                 if not watch.empty:
@@ -1351,7 +1410,7 @@ with market_tab:
                         "想定最大損失": st.column_config.NumberColumn("想定最大損失", format="%,.0f円"),
                     },
                 )
-            st.download_button("最終100点ランキングCSVを保存", final_rank.drop(columns=["_priority"], errors="ignore").to_csv(index=False).encode("utf-8-sig"), file_name="japan_stock_final_100_ranking_v803.csv", mime="text/csv", key="download_deep")
+            st.download_button("最終100点ランキングCSVを保存", final_rank.drop(columns=["_priority"], errors="ignore").to_csv(index=False).encode("utf-8-sig"), file_name="japan_stock_final_100_ranking_v804.csv", mime="text/csv", key="download_deep")
             st.warning("最終売買前は、上位候補を『個別』タブで開き、重要開示・決算日も確認してください。売買プランは確定日足ベースの参考値であり、利益を保証するものではありません。")
 
 with scanner_tab:
@@ -1570,4 +1629,4 @@ with guide_tab:
     """)
 
 st.divider()
-st.caption("V8.0.3の原則：高得点でも、弱い市場・弱いOOS検証・過大なリスクなら買いません。Standard単体では確定日足を基準にし、リアルタイム気配としては扱いません。本システムは売買判断支援ツールで、利益を保証するものではありません。")
+st.caption("V8.0.4の原則：高得点でも、弱い市場・弱いOOS検証・過大なリスクなら買いません。Standard単体では確定日足を基準にし、リアルタイム気配としては扱いません。本システムは売買判断支援ツールで、利益を保証するものではありません。")

@@ -31,11 +31,11 @@ def _models() -> List[Pipeline]:
         ]),
         Pipeline([
             ("imputer", SimpleImputer(strategy="median")),
-            ("model", HistGradientBoostingClassifier(max_depth=3, learning_rate=0.05, max_iter=220, l2_regularization=1.0, random_state=42)),
+            ("model", HistGradientBoostingClassifier(max_depth=3, learning_rate=0.05, max_iter=140, l2_regularization=1.0, random_state=42)),
         ]),
         Pipeline([
             ("imputer", SimpleImputer(strategy="median")),
-            ("model", RandomForestClassifier(n_estimators=350, max_depth=5, min_samples_leaf=12, max_features="sqrt", class_weight="balanced_subsample", random_state=42, n_jobs=-1)),
+            ("model", RandomForestClassifier(n_estimators=180, max_depth=5, min_samples_leaf=12, max_features="sqrt", class_weight="balanced_subsample", random_state=42, n_jobs=1)),
         ]),
     ]
 
@@ -51,6 +51,7 @@ def walk_forward_ensemble(
     min_train_rows: int = 504,
     test_rows: int = 126,
     embargo_rows: int = 20,
+    X_live: pd.DataFrame | None = None,
 ) -> WalkForwardResult:
     X = X.copy()
     y = y.loc[X.index].astype(int)
@@ -104,7 +105,8 @@ def walk_forward_ensemble(
     for m in _models():
         m.fit(X, y)
         fitted.append(m)
-    latest_probability = float(_ensemble_predict(fitted, X.tail(1))[0])
+    live_x = X_live[X.columns].tail(1) if X_live is not None and not X_live.empty else X.tail(1)
+    latest_probability = float(_ensemble_predict(fitted, live_x)[0])
     return WalkForwardResult(probs, aggregate, latest_probability, X.shape[1], len(X))
 
 
