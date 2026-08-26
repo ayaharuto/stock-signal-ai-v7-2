@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from datetime import date, timedelta
 from typing import Dict, Tuple
 
@@ -42,8 +43,16 @@ from sources import (
     SourceStatus,
     source_confidence,
 )
+from answer_check import (
+    make_snapshot,
+    load_gist_records,
+    upsert_gist_records,
+    evaluate_snapshot,
+    answer_table,
+    summarize_answers,
+)
 
-st.set_page_config(page_title="Stock Signal AI v8.0.4", page_icon="📈", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Stock Signal AI v8.1", page_icon="📈", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown(
     """
@@ -69,7 +78,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("Stock Signal AI v8.0.4")
+st.title("Stock Signal AI v8.1")
 st.caption("個人向けJ-Quants API V2対応。V8は『当てる』だけでなく、**市場環境・アウトオブサンプル優位性・資金管理・現実的な約定検証**を通過した銘柄だけを実戦候補にします。取得できないデータは推測で埋めません。")
 
 def _safe_secret(name: str, default: str = "") -> str:
@@ -88,6 +97,87 @@ def _sanitize_api_error(exc: Exception) -> str:
     # Do not echo secrets if an upstream service ever includes request headers in an error.
     key = _safe_secret("JQUANTS_API_KEY", "")
     return text.replace(key, "***") if key else text
+
+
+ANSWER_LOCAL_FILE = ".prediction_history_local.json"
+
+
+def _answer_store_credentials() -> tuple[str, str]:
+    """Return optional persistent Gist credentials.
+
+    If they are not configured, the app uses a local journal file. The local fallback
+    is intentionally zero-setup, but Streamlit Cloud may erase it on redeploy/rebuild.
+    """
+    token = _safe_secret("GITHUB_GIST_TOKEN", "")
+    gist_id = _safe_secret("PREDICTION_GIST_ID", "")
+    return token, gist_id
+
+
+def _load_local_answer_records() -> list[dict]:
+    if not os.path.exists(ANSWER_LOCAL_FILE):
+        return []
+    try:
+        with open(ANSWER_LOCAL_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return [dict(x) for x in data if isinstance(x, dict)]
+    except Exception:
+        pass
+    return []
+
+
+def _save_local_answer_records(records: list[dict]) -> None:
+    tmp = ANSWER_LOCAL_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, ANSWER_LOCAL_FILE)
+
+
+def _load_answer_records() -> list[dict]:
+    token, gist_id = _answer_store_credentials()
+    if token and gist_id:
+        return load_gist_records(token, gist_id)
+    return _load_local_answer_records()
+
+
+def _upsert_answer_records(new_records: list[dict]) -> tuple[list[dict], int, int]:
+    token, gist_id = _answer_store_credentials()
+    if token and gist_id:
+        return upsert_gist_records(token, gist_id, new_records)
+
+    current = _load_local_answer_records()
+    by_id: dict[str, dict] = {}
+    order: list[str] = []
+    for rec in current:
+        sid = str(rec.get("snapshot_id") or "")
+        if not sid:
+            continue
+        if sid not in by_id:
+            order.append(sid)
+        by_id[sid] = dict(rec)
+
+    inserted = 0
+    updated = 0
+    for rec in new_records:
+        sid = str(rec.get("snapshot_id") or "")
+        if not sid:
+            continue
+        if sid in by_id:
+            updated += 1
+        else:
+            inserted += 1
+            order.append(sid)
+        by_id[sid] = dict(rec)
+
+    merged = [by_id[sid] for sid in order]
+    merged.sort(key=lambda x: (str(x.get("base_date", "")), str(x.get("code", ""))))
+    _save_local_answer_records(merged)
+    return merged, inserted, updated
+
+
+def _answer_store_label() -> str:
+    token, gist_id = _answer_store_credentials()
+    return "GitHub Gist（永続保存）" if token and gist_id else "Streamlitローカル（簡易保存）"
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -384,7 +474,7 @@ def analyze_one(
         embargo_rows=cfg.horizon_days,
         X_live=X_live,
     )
-    # V8.0.4: the final fitted ensemble is reused for the live prediction.
+    # V8.1: the final fitted ensemble is reused for the live prediction.
     # This avoids fitting the same three models twice for every candidate.
     live_p = wf.latest_probability
     src_conf = source_confidence(statuses)
@@ -729,7 +819,7 @@ def build_trade_plan(result: Dict) -> Dict[str, object]:
     shares_alloc = int((float(account_capital) * float(max_position_pct) / 100.0) // (entry_mid * 100)) * 100
     conditional_shares = max(0, min(shares_risk, shares_alloc))
 
-    # V8.0.4: a position size is an ACTION only when both the practical gate and the
+    # V8.1: a position size is an ACTION only when both the practical gate and the
     # price gate are satisfied.  Watch/skip names must never look like an order suggestion.
     execution_ready = bool(decision in {"買い候補", "条件付き買い"} and timing == "買いゾーン内")
     suggested_shares = conditional_shares if execution_ready else 0
@@ -883,7 +973,7 @@ def component_table(result: Dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-market_tab, main_tab, scanner_tab, validation_tab, adaptive_tab, guide_tab = st.tabs(["🌐 今日", "🔎 個別", "🏆 100点", "🧪 検証", "🧠 配点", "📘 仕組み"])
+market_tab, main_tab, scanner_tab, validation_tab, adaptive_tab, answer_tab, guide_tab = st.tabs(["🌐 今日", "🔎 個別", "🏆 100点", "🧪 検証", "🧠 配点", "📝 答え合わせ", "📘 仕組み"])
 
 with main_tab:
     left, right = st.columns([1.15, 0.85])
@@ -1081,12 +1171,12 @@ with market_tab:
     radar_days = mc1.selectbox("全市場履歴", [330, 390, 450], index=1, format_func=lambda x: f"約{x}暦日")
     deep_n = mc2.selectbox(
         "最終精査する上位数", [8, 10, 15, 20], index=1,
-        help="V8.0.4は通常10銘柄を推奨。自動更新は最大10銘柄まで精査し、必要な時だけ手動で15〜20銘柄を追加確認します。",
+        help="V8.1は通常10銘柄を推奨。自動更新は最大10銘柄まで精査し、必要な時だけ手動で15〜20銘柄を追加確認します。",
     )
     min_turn_m = mc3.number_input("最低売買代金/日（百万円）", min_value=0, max_value=5000, value=50, step=50, help="百万円。流動性が極端に低い銘柄を除外します。")
     preferred = mc4.multiselect("優先レーダー", ["需給先回り候補", "初動レーダー", "押し目レーダー", "上昇継続レーダー", "過熱警戒", "需給悪化警戒", "監視"], default=["需給先回り候補", "初動レーダー", "押し目レーダー", "上昇継続レーダー"])
 
-    st.info("初回だけ過去の全市場日次データを公式APIから収集します。V8.0.4は全市場集計と最終AI評価を6時間キャッシュし、同じ日の再計算を極力避けます。")
+    st.info("初回だけ過去の全市場日次データを公式APIから収集します。V8.1は全市場集計と最終AI評価を6時間キャッシュし、同じ日の再計算を極力避けます。")
     st.caption("⚙️ CPUセーフ設計：通常のワンクリック更新は上位10銘柄まで最終精査します。11位以下も確認したい場合だけ『上位○銘柄を再精査』を手動で実行してください。")
     st.caption("データ範囲はJ-Quants契約プランに連動します。Light以上で現在株価、Standard以上で信用・空売り、Premiumで売買内訳が追加されます。取得できない項目は推測せず、需給充足度を下げて評価します。")
 
@@ -1171,7 +1261,7 @@ with market_tab:
         rr4.metric("先回り80点以上", int((radar["early_radar_score"] >= 80).sum()))
 
         st.markdown("### 上位候補を最終100点評価")
-        st.caption("ここからは価格だけでなく、財務・AIのWalk-forward検証・情報信頼度を含めて再評価します。V8.0.4は同じ銘柄・同じ基準日のAI結果を再利用し、無駄な再学習を避けます。")
+        st.caption("ここからは価格だけでなく、財務・AIのWalk-forward検証・情報信頼度を含めて再評価します。V8.1は同じ銘柄・同じ基準日のAI結果を再利用し、無駄な再学習を避けます。")
         manual_deep = st.button(f"上位 {deep_n} 銘柄を再精査", type="secondary", use_container_width=True, key="deep_scan_top")
         auto_deep = bool(st.session_state.pop("auto_deep_scan_requested", False))
         if manual_deep or auto_deep:
@@ -1186,6 +1276,7 @@ with market_tab:
                 start = end - timedelta(days=int(years * 365.25 + 300))
                 dprog = st.progress(0, text="最終100点評価を開始（同日結果は再利用）")
                 final_rows = []
+                prediction_snapshots = []
                 listed_meta = st.session_state.get("market_listed", pd.DataFrame())
                 name_map = dict(zip(listed_meta.get("Code", pd.Series(dtype=str)).astype(str), listed_meta.get("CompanyName", pd.Series(dtype=str)))) if not listed_meta.empty else {}
                 for i, scode in enumerate(candidates):
@@ -1193,10 +1284,23 @@ with market_tab:
                     try:
                         res, ss = analyze_market_candidate_cached(
                             jq_api_key, scode, start.isoformat(), end.isoformat(), str(benchmark_code),
-                            fred_key, int(horizon), int(tx_cost), "v804",
+                            fred_key, int(horizon), int(tx_cost), "v810",
                         )
                         rr = radar[radar["Code"].astype(str) == scode].head(1)
                         plan = build_trade_plan(res)
+                        try:
+                            prediction_snapshots.append(make_snapshot(
+                                code=scode,
+                                company_name=name_map.get(scode, ""),
+                                result=res,
+                                plan=plan,
+                                benchmark_code=str(benchmark_code),
+                                model_horizon_days=int(horizon),
+                                app_version="v8.1",
+                            ))
+                        except Exception:
+                            # Journal failure must never break the trading analysis itself.
+                            pass
                         final_rows.append({
                             "Code": scode,
                             "会社名": name_map.get(scode, ""),
@@ -1234,7 +1338,7 @@ with market_tab:
                             "評価": res["label"],
                         })
                     except Exception as e:
-                        # V8.0.4 distinguishes a normal "history too short" exclusion from a real error.
+                        # V8.1 distinguishes a normal "history too short" exclusion from a real error.
                         # New listings must not make the whole scan look broken.
                         err = _sanitize_api_error(e)[:180]
                         low_err = err.lower()
@@ -1290,6 +1394,14 @@ with market_tab:
                             "分析エラー": error_text,
                         })
                 dprog.empty()
+                if prediction_snapshots:
+                    try:
+                        _, inserted_j, updated_j = _upsert_answer_records(prediction_snapshots)
+                        st.session_state["answer_journal_status"] = (
+                            f"予測ジャーナル保存済み：新規 {inserted_j}件 / 更新 {updated_j}件 ｜ {_answer_store_label()}"
+                        )
+                    except Exception as e:
+                        st.session_state["answer_journal_status"] = f"予測ジャーナル保存のみ失敗：{_sanitize_api_error(e)[:120]}"
                 final_rank = pd.DataFrame(final_rows)
                 # Defensive schema: a failed batch can otherwise have no sort columns at all.
                 required_defaults = {
@@ -1317,6 +1429,8 @@ with market_tab:
             ok_n = int(counts.get("ok", pd.to_numeric(final_rank.get("買い候補100点", pd.Series(dtype=float)), errors="coerce").notna().sum()))
             excluded_n = int(counts.get("excluded", (final_rank.get("評価", pd.Series(index=final_rank.index, dtype=str)).astype(str) == "評価対象外").sum()))
             fail_n = int(counts.get("failed", (final_rank.get("評価", pd.Series(index=final_rank.index, dtype=str)).astype(str) == "分析失敗").sum()))
+            if st.session_state.get("answer_journal_status"):
+                st.caption("📝 " + str(st.session_state.get("answer_journal_status")))
             if excluded_n:
                 st.info(f"最終精査 {ok_n}銘柄成功 / {excluded_n}銘柄は履歴不足等で評価対象外。これはシステム障害ではありません。")
                 if "除外理由" in final_rank.columns:
@@ -1346,7 +1460,7 @@ with market_tab:
                 conclusion = pd.DataFrame()
             if conclusion.empty:
                 st.markdown("### 今日やること")
-                st.info("**新規買いは0株。今日は待つ日です。** 実戦ゲートを通過した銘柄がありません。条件を緩めて買わないことをV8.0.4の正式な判断とします。")
+                st.info("**新規買いは0株。今日は待つ日です。** 実戦ゲートを通過した銘柄がありません。条件を緩めて買わないことをV8.1の正式な判断とします。")
                 watch_score = pd.to_numeric(final_rank.get("買い候補100点", pd.Series(index=final_rank.index, dtype=float)), errors="coerce")
                 watch = final_rank[(final_rank.get("判定", "") == "監視") & watch_score.notna()].copy()
                 if not watch.empty:
@@ -1410,7 +1524,7 @@ with market_tab:
                         "想定最大損失": st.column_config.NumberColumn("想定最大損失", format="%,.0f円"),
                     },
                 )
-            st.download_button("最終100点ランキングCSVを保存", final_rank.drop(columns=["_priority"], errors="ignore").to_csv(index=False).encode("utf-8-sig"), file_name="japan_stock_final_100_ranking_v804.csv", mime="text/csv", key="download_deep")
+            st.download_button("最終100点ランキングCSVを保存", final_rank.drop(columns=["_priority"], errors="ignore").to_csv(index=False).encode("utf-8-sig"), file_name="japan_stock_final_100_ranking_v810.csv", mime="text/csv", key="download_deep")
             st.warning("最終売買前は、上位候補を『個別』タブで開き、重要開示・決算日も確認してください。売買プランは確定日足ベースの参考値であり、利益を保証するものではありません。")
 
 with scanner_tab:
@@ -1601,6 +1715,119 @@ with adaptive_tab:
             if opt.get("status") != "optimized":
                 st.warning("検証力が不足しているため、V8は従来配点を維持します。無理に最適化しません。")
 
+
+with answer_tab:
+    st.subheader("予想の答え合わせ")
+    st.caption("『その日に何を予想したか』を残し、5・20・60営業日後の実際の値動きと照合します。買い候補だけでなく、見送りが正解だったか・機会損失だったかも評価します。")
+
+    token_j, gist_id_j = _answer_store_credentials()
+    if token_j and gist_id_j:
+        st.success("✅ 予測履歴は GitHub Gist に永続保存されています。")
+    else:
+        st.info("現在はゼロ設定の簡易保存です。このまま答え合わせを試せます。Streamlitの再デプロイ等で履歴が消える可能性があるため、長期運用時だけGitHub Gist保存へ切り替えるのがおすすめです。")
+        with st.expander("長期保存を有効にする方法（今すぐ設定しなくてもOK）", expanded=False):
+            st.markdown("""
+Streamlit の **Settings → Secrets** に次の2つを登録すると、予測履歴をGitHub Gistへ永続保存できます。
+
+`GITHUB_GIST_TOKEN = "GitHubのGist書き込み用トークン"`
+
+`PREDICTION_GIST_ID = "保存先GistのID"`
+
+APIキーやトークンはGitHubの公開コードへ直接書かないでください。
+""")
+
+    try:
+        journal_records = _load_answer_records()
+    except Exception as e:
+        journal_records = []
+        st.error(f"予測履歴を読み込めませんでした: {_sanitize_api_error(e)[:180]}")
+
+    st.metric("保存済み予測", f"{len(journal_records):,}件")
+    if not journal_records:
+        st.info("まだ予測履歴がありません。『🌐 今日』で **本日の結論を更新** を1回実行すると、その日の最終精査結果が自動で記録されます。")
+    else:
+        if st.button("最新の確定日足で答え合わせを更新", type="primary", use_container_width=True, key="run_answer_check"):
+            if not jq_connected:
+                st.error("答え合わせにはJ-Quants APIへの接続が必要です。")
+            else:
+                updated_records = []
+                errors = []
+                progress_ans = st.progress(0, text="過去予想を実際の値動きと照合中")
+                end_ans = date.today()
+                # Benchmark is reused across records as much as possible by the existing cache.
+                for i, rec in enumerate(journal_records):
+                    progress_ans.progress((i + 1) / max(len(journal_records), 1), text=f"{rec.get('code','')} を答え合わせ中")
+                    try:
+                        base_d = pd.Timestamp(rec.get("base_date")).date()
+                        start_d = base_d - timedelta(days=10)
+                        px_ans = load_jq_quotes(jq_api_key, str(rec.get("code", "")), start_d.isoformat(), end_ans.isoformat())
+                        bm_code_ans = str(rec.get("benchmark_code") or benchmark_code)
+                        bm_ans = load_jq_quotes(jq_api_key, bm_code_ans, start_d.isoformat(), end_ans.isoformat())
+                        updated_records.append(evaluate_snapshot(rec, px_ans, bm_ans, horizons=(5, 20, 60)))
+                    except Exception as e:
+                        kept = dict(rec)
+                        kept["answer_reason"] = "答え合わせ更新失敗: " + _sanitize_api_error(e)[:120]
+                        updated_records.append(kept)
+                        errors.append(f"{rec.get('code','')}: {_sanitize_api_error(e)[:90]}")
+                progress_ans.empty()
+                try:
+                    merged_ans, _, _ = _upsert_answer_records(updated_records)
+                    st.session_state["answer_records"] = merged_ans
+                    st.success(f"答え合わせを更新しました。{len(updated_records):,}件を再評価しました。")
+                    if errors:
+                        st.warning(f"{len(errors)}件は価格取得等で更新できませんでした。既存記録は残しています。")
+                except Exception as e:
+                    st.error(f"答え合わせ結果の保存に失敗しました: {_sanitize_api_error(e)[:180]}")
+
+        records_view = st.session_state.get("answer_records", journal_records)
+        summary_ans = summarize_answers(records_view)
+        a1, a2, a3, a4 = st.columns(4)
+        a1.metric("20日評価済み", f"{int(summary_ans.get('matured_20',0))}件")
+        avg_match = _finite_float(summary_ans.get("avg_match_score"), np.nan)
+        a2.metric("平均一致度", f"{avg_match:.1f}/100" if np.isfinite(avg_match) else "—")
+        buy_sr = _finite_float(summary_ans.get("buy_success_rate"), np.nan)
+        a3.metric("買い判断成功率", f"{buy_sr:.1%}" if np.isfinite(buy_sr) else "—")
+        skip_sr = _finite_float(summary_ans.get("skip_success_rate"), np.nan)
+        a4.metric("見送り判断成功率", f"{skip_sr:.1%}" if np.isfinite(skip_sr) else "—")
+
+        avg_r20 = _finite_float(summary_ans.get("avg_ret20"), np.nan)
+        avg_ex20 = _finite_float(summary_ans.get("avg_excess20"), np.nan)
+        if np.isfinite(avg_r20) or np.isfinite(avg_ex20):
+            st.caption(
+                "20日評価済み予想の平均："
+                + (f"騰落率 {avg_r20:+.2%}" if np.isfinite(avg_r20) else "騰落率 —")
+                + " ｜ "
+                + (f"ベンチマーク超過 {avg_ex20:+.2%}" if np.isfinite(avg_ex20) else "ベンチマーク超過 —")
+            )
+
+        ans_df = answer_table(records_view)
+        if not ans_df.empty:
+            st.markdown("### 予想ごとの答え")
+            st.dataframe(
+                ans_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "100点評価": st.column_config.NumberColumn("100点評価", format="%.1f"),
+                    "AI確率%": st.column_config.NumberColumn("AI確率", format="%.1f%%"),
+                    "一致度": st.column_config.ProgressColumn("一致度", min_value=0, max_value=100, format="%.1f"),
+                    "5日%": st.column_config.NumberColumn("5日", format="%+.2f%%"),
+                    "20日%": st.column_config.NumberColumn("20日", format="%+.2f%%"),
+                    "60日%": st.column_config.NumberColumn("60日", format="%+.2f%%"),
+                    "20日超過%": st.column_config.NumberColumn("20日超過", format="%+.2f%%"),
+                    "MFE20%": st.column_config.NumberColumn("20日最大上昇", format="%+.2f%%"),
+                    "MAE20%": st.column_config.NumberColumn("20日最大下落", format="%+.2f%%"),
+                },
+            )
+            st.download_button(
+                "答え合わせCSVを保存",
+                ans_df.to_csv(index=False).encode("utf-8-sig"),
+                file_name="stock_signal_answer_check_v81.csv",
+                mime="text/csv",
+                key="download_answer_check",
+            )
+            st.caption("一致度は『当時の判断と、その後の実際の動きがどれくらい整合したか』の評価です。20営業日未満の予想は途中経過として扱い、十分な日数がたまってから最終評価します。")
+
 with guide_tab:
     st.subheader("100点の配点")
     allocation = pd.DataFrame([
@@ -1629,4 +1856,4 @@ with guide_tab:
     """)
 
 st.divider()
-st.caption("V8.0.4の原則：高得点でも、弱い市場・弱いOOS検証・過大なリスクなら買いません。Standard単体では確定日足を基準にし、リアルタイム気配としては扱いません。本システムは売買判断支援ツールで、利益を保証するものではありません。")
+st.caption("V8.1の原則：高得点でも、弱い市場・弱いOOS検証・過大なリスクなら買いません。予想はジャーナルに残し、後日5・20・60営業日で答え合わせします。Standard単体では確定日足を基準にし、リアルタイム気配としては扱いません。本システムは売買判断支援ツールで、利益を保証するものではありません。")
